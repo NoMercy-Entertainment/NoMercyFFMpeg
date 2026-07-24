@@ -132,6 +132,7 @@ Our custom FFmpeg builds include several features **NOT** available in official 
 | **Chapter VTT muxer** | Muxer | Exports chapter metadata as WebVTT |
 | **VOBsub muxer** | Muxer | Writes DVD-style VOBsub subtitle output |
 | **OmniDrive protocol** | Protocol | Direct I/O against NoMercy OmniDrive storage (Linux/Windows/FreeBSD) |
+| **`dvdread:` protocol** | Protocol | `dvdread://` URI input (byte-stream over libdvdread title VOBs, symmetric with `bluray://`) |
 | **Auto-create directories** | Core patch | Output muxers automatically create missing parent directories |
 | **`whisper` language detection** | Filter patch | The `whisper` filter exposes the auto-detected spoken language (`lavfi.whisper.language` + `lavfi.whisper.language_confidence` frame metadata, `detected_language` object in JSON output) |
 | **AACS/BD+ static keydb** | Patch | libaacs/libbluray patched for built-in Blu-ray decryption support |
@@ -166,7 +167,7 @@ Our custom FFmpeg builds include several features **NOT** available in official 
 
 #### 📀 **Disc & Container Support**
 - **Blu-ray**: libbluray + libaacs with static keydb patches for decryption
-- **DVD**: libdvdread + libdvdnav, plus the custom VOBsub muxer
+- **DVD**: libdvdread + libdvdnav, plus the custom VOBsub muxer and the `dvdread://` input protocol
 - **CD**: libcdio audio extraction
 - **Streaming**: SRT protocol, OpenSSL TLS
 - **Subtitles**: libass rendering, libzvbi teletext, OCR-based bitmap-to-text conversion
