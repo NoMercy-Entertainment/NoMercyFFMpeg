@@ -1,0 +1,64 @@
+NoMercy-only: report the alpha pixel format at stream level
+
+Not an upstream commit -- FFmpeg master behaves the same as stock 8.1.2 here.
+Depends on hevc-alpha-videotoolbox.patch; meaningless without it.
+
+With the alpha layer decoding correctly, `ffprobe -show_frames` reports
+pix_fmt=yuva420p but `ffprobe -show_streams` still reports yuv420p. The cause
+is not probe depth (-probesize/-analyzeduration/-fflags noparse make no
+difference): avformat_find_stream_info() resolves the stream parameters from
+the extradata and returns "All info found" without ever decoding a slice, so
+get_format() -- where the auxiliary alpha layer is picked up and avctx->pix_fmt
+becomes yuva420p -- has not run when libavformat copies avctx->pix_fmt into
+st->codecpar->format.
+
+This makes export_stream_params(), which runs on the extradata path, apply the
+same alpha mapping get_format() would. It cannot call ff_hevc_is_alpha_video()
+directly because that reads s->vps, which set_sps() binds later, so the VPS
+condition is mirrored against sps->vps instead. map_to_alpha_format() is
+defined further down the file and is forward-declared for this.
+
+Only the advertised format changes. get_format() still builds its candidate
+list from sps->pix_fmt, so hwaccel negotiation is untouched, and when a
+hardware format wins, ff_get_format() overwrites avctx->pix_fmt as before.
+
+Drop this file to fall back to upstream behaviour -- 59-hevc-alpha-layer.sh
+applies it only when present.
+
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -328,6 +328,10 @@
+     return 0;
+ }
+ 
++/* Defined below; forward-declared so export_stream_params() can reach it. */
++static enum AVPixelFormat map_to_alpha_format(HEVCContext *s,
++                                              enum AVPixelFormat pix_fmt);
++
+ static void export_stream_params(HEVCContext *s, const HEVCSPS *sps)
+ {
+     AVCodecContext *avctx = s->avctx;
+@@ -336,6 +340,23 @@
+     unsigned int num = 0, den = 0;
+ 
+     avctx->pix_fmt             = sps->pix_fmt;
++
++    /* avformat_find_stream_info() resolves stream parameters straight from the
++     * extradata and returns without ever decoding a slice, so get_format() --
++     * where the auxiliary alpha layer is normally picked up -- has not run at
++     * this point. Advertise the alpha pixel format here too, otherwise ffprobe
++     * reports the base-layer format for HEVC-with-alpha video while the frames
++     * it actually decodes are yuva*. Mirrors the condition in
++     * ff_hevc_is_alpha_video(), which cannot be reused here because it reads
++     * s->vps -- only bound later, in set_sps().
++     */
++    if (vps && vps->nb_layers == 2 && vps->layer_id_in_nuh[1] &&
++        (vps->scalability_mask_flag & HEVC_SCALABILITY_AUXILIARY)) {
++        enum AVPixelFormat alpha_fmt = map_to_alpha_format(s, sps->pix_fmt);
++
++        if (alpha_fmt != AV_PIX_FMT_NONE)
++            avctx->pix_fmt = alpha_fmt;
++    }
+     avctx->coded_width         = sps->width;
+     avctx->coded_height        = sps->height;
+     avctx->width               = sps->width  - ow->left_offset - ow->right_offset;
