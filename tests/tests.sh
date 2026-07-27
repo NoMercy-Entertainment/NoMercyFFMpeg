@@ -1,6 +1,39 @@
 #!/bin/bash
+# Full codec + hardware suite for a nomercy-ffmpeg build.
+#
+# Usage: tests.sh <workspace> [--platform <name>] [--json <report path>]
+#
+# Hardware-accelerated encoders are gated on the host actually having the
+# hardware (see lib/capabilities.sh). A missing GPU is a skip with a recorded
+# reason, never a failure — and never a silent pass either.
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/capabilities.sh
+source "${HERE}/lib/capabilities.sh"
+# shellcheck source=lib/report.sh
+source "${HERE}/lib/report.sh"
 
 Workspace="$1"
+shift 2>/dev/null || true
+
+Platform=""
+ReportPath=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--platform)
+		Platform="$2"
+		shift 2
+		;;
+	--json)
+		ReportPath="$2"
+		shift 2
+		;;
+	*)
+		echo "Error: unknown argument '$1'." >&2
+		exit 1
+		;;
+	esac
+done
 
 if [[ -z "$Workspace" ]]; then
 	echo "Error: Workspace path is required." >&2
@@ -11,6 +44,9 @@ if [[ -L "$Workspace" ]]; then
 	echo "Error: Workspace path cannot be a symbolic link." >&2
 	exit 1
 fi
+
+[[ -z "$Platform" ]] && Platform="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+report_init "$Platform"
 
 TOTAL_WIDTH_TEXT=54
 TOTAL_TESTS=0
@@ -27,22 +63,13 @@ SampleSubs="${TestRoot}/sample.ass"
 rm -rf "${TestRoot}"
 mkdir -p "${TestRoot}"
 
+# Counts the call sites at the bottom of this file so the progress counter can
+# read "[3/25]". Anchored at line start so the definitions above never count.
 get_test_runs_count() {
-	local searchString="$1"
-	local filePath="$0"
-	local fileContent
-	local matches
-	local m_count
-	fileContent=$(<"$filePath")
-	_matches=$(grep -o "$searchString" <<<"$fileContent")
-	matches_count=$(echo "$_matches" | wc -l)
-	if [ "$matches_count" -gt 0 ]; then
-		matches_count=$((matches_count - 1))
-	fi
-	echo "$matches_count"
+	grep -cE '^(run_test|run_hw_test) "' "${BASH_SOURCE[0]}"
 }
 
-TOTAL_RUNS=$(get_test_runs_count 'run_test "')
+TOTAL_RUNS=$(get_test_runs_count)
 
 generate_samples() {
 	local Total_Count=0
@@ -152,6 +179,7 @@ run_test() {
 	local expected_output=$3
 	local test_output
 	local exit_code
+	local duration
 
 	TOTAL_TESTS=$((TOTAL_TESTS + 1))
 	name=$(echo $name | tr '[:lower:]' '[:upper:]')
@@ -161,48 +189,47 @@ run_test() {
 
 	test_output=$(eval "${Workspace}/ffmpeg $command" 2>&1)
 	exit_code=$?
+	End_Time=$(date +%s)
+	duration=$((End_Time - Start_Time))
+
 	if [[ $exit_code -eq 0 ]] && echo "$test_output" | grep -q "$expected_output"; then
-		End_Time=$(date +%s)
-		text_with_padding "✅ ${name} test passed" "[$((End_Time - Start_Time))s]" 1
+		text_with_padding "✅ ${name} test passed" "[${duration}s]" 1
 		PASSED_TESTS=$((PASSED_TESTS + 1))
+		report_add "${name}" passed "${duration}"
 	else
-		End_Time=$(date +%s)
-		text_with_padding "❌ ${name} test failed" "[$((End_Time - Start_Time))s]" 1
+		text_with_padding "❌ ${name} test failed" "[${duration}s]" 1
 		FAILED_TESTS=$((FAILED_TESTS + 1))
+		# Print the diagnosis. A red run that swallows its own output costs
+		# another full round trip on whichever machine happens to own it.
+		echo "   exit=${exit_code}, expected to match: ${expected_output}"
+		echo "$test_output" | tail -12 | sed 's/^/   | /'
+		report_add "${name}" failed "${duration}" \
+			"exit ${exit_code}; $(echo "$test_output" | tail -3 | tr '\n' ' ')"
 	fi
 }
 
-test_support() {
-	local feature=$1
+# Same contract as run_test, but the encoder only runs when the host owns the
+# hardware. Absent hardware skips WITH the reason recorded, so a skip can be
+# audited later instead of being indistinguishable from a pass.
+run_hw_test() {
+	local name=$1
+	local capability=$2
+	local command=$3
+	local expected_output=$4
+	local reason
 
-	# Haal GPU informatie op via lspci
-	local gpu_info
-	gpu_info=$(lspci 2>/dev/null | grep -E "VGA|Display|3D")
-
-	if [ "$feature" = "AMF" ]; then
-		# Check of het een AMD GPU is en of de AMF library bestaat (vaak meegeleverd met AMDVLK/Pro drivers)
-		echo "$gpu_info" | grep -iq "AMD"
-		local has_amd=$?
-
-		# Check veelvoorkomende locaties voor de AMF library op Linux
-		if [ $has_amd -eq 0 ] && [ -f "/usr/lib/x86_64-linux-gnu/libamfrt64.so" ] || [ -f "/usr/lib64/libamfrt64.so" ] || [ -f "/opt/amdgpu-pro/lib/x86_64-linux-gnu/libamfrt64.so" ]; then
-			return 0 # True / Ondersteund
-		fi
-		return 1 # False
-
-	elif [ "$feature" = "VPL" ]; then
-		# Check of het een Intel GPU is
-		echo "$gpu_info" | grep -iq "Intel"
-		local has_intel=$?
-
-		# Check voor oneVPL / Media SDK bibliotheken (libvpl of libmfx)
-		if [ $has_intel -eq 0 ] && ldconfig -p 2>/dev/null | grep -E -q "libvpl\.so|libmfx\.so"; then
-			return 0 # True / Ondersteund
-		fi
-		return 1 # False
+	if reason=$(hw_capability_reason "$capability"); then
+		run_test "$name" "$command" "$expected_output"
+		return
 	fi
 
-	return 1
+	TOTAL_TESTS=$((TOTAL_TESTS + 1))
+	name=$(echo $name | tr '[:lower:]' '[:upper:]')
+	text_with_padding "🧪 Testing ${name}" "[${TOTAL_TESTS}/${TOTAL_RUNS}]" 1
+	text_with_padding "➖ ${name} was skipped" "[0s]" 1
+	echo "   ${reason}"
+	SKIPPED_TESTS=$((SKIPPED_TESTS + 1))
+	report_add "${name}" skipped 0 "${reason}"
 }
 
 # Main execution
@@ -238,27 +265,11 @@ run_test "libopenjpeg" "-y -i ${SampleImage} -c:v libopenjpeg ${TestRoot}/test_j
 run_test "libass" "-y -i ${SampleVideo} -vf \"ass=${SampleSubs}\" ${TestRoot}/test_ass.mp4" "ass"
 run_test "auto_mkdir" "-y -f lavfi -i \"testsrc=duration=1:size=320x240:rate=1\" -frames:v 1 ${TestRoot}/subdir_test/nested/output.png" "output.png"
 
-# Hardware acceleration (may fail if no hardware support)
-run_test "NVENC" "-y -i ${SampleVideo} -c:v h264_nvenc ${TestRoot}/test_nvenc.mp4" "nvenc"
-# Check for Intel GPU/driver otherwise skip
-if test_support "VPL"; then
-	run_test "VPL" "-y -i ${SampleVideo} -c:v h264_vpl ${TestRoot}/test_vpl.mp4" "vpl"
-else
-	TOTAL_TESTS=$((TOTAL_TESTS + 1))
-	text_with_padding "🧪 Testing VPL" "[$script:TOTAL_TESTS/$TOTAL_RUNS]"
-	text_with_padding "➖ VPL was skipped" "[ 0s ]" 1
-	SKIPPED_TESTS=$((SKIPPED_TESTS + 1))
-fi
-
-# Check for AMD GPU/driver otherwise skip
-if test_support "AMF"; then
-	run_test "AMF" "-y -i ${SampleVideo} -c:v h264_amf ${TestRoot}/test_amf.mp4" "amf"
-else
-	TOTAL_TESTS=$((TOTAL_TESTS + 1))
-	text_with_padding "🧪 Testing AMF" "[$script:TOTAL_TESTS/$TOTAL_RUNS]"
-	text_with_padding "➖ AMF was skipped" "[ 0s ]" 1
-	SKIPPED_TESTS=$((SKIPPED_TESTS + 1))
-fi
+# Hardware acceleration — each runs only where the hardware exists.
+run_hw_test "NVENC" nvenc "-y -i ${SampleVideo} -c:v h264_nvenc ${TestRoot}/test_nvenc.mp4" "nvenc"
+run_hw_test "VPL" vpl "-y -i ${SampleVideo} -c:v h264_vpl ${TestRoot}/test_vpl.mp4" "vpl"
+run_hw_test "AMF" amf "-y -i ${SampleVideo} -c:v h264_amf ${TestRoot}/test_amf.mp4" "amf"
+run_hw_test "VIDEOTOOLBOX" videotoolbox "-y -i ${SampleVideo} -c:v h264_videotoolbox ${TestRoot}/test_vt.mp4" "videotoolbox"
 
 # Additional format tests
 run_test "libbluray" "-hide_banner -protocols | grep bluray" "bluray"
@@ -284,6 +295,11 @@ text_with_padding "Failed tests:" "${FAILED_TESTS}"
 text_with_padding "Total tests:" "${TOTAL_TESTS}"
 printf "%${TOTAL_WIDTH_TEXT}s\n" | tr ' ' '-' # Print a horizontal line
 echo ""
+
+if [[ -n "$ReportPath" ]]; then
+	report_write "$ReportPath" "${Workspace}/ffmpeg"
+	echo "📄 Report written to ${ReportPath}"
+fi
 
 rm -rf "${TestRoot}"
 

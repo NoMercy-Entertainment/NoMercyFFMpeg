@@ -1,6 +1,19 @@
+# Full codec + hardware suite for a nomercy-ffmpeg build.
+#
+# Hardware-accelerated encoders are gated on the host actually having the
+# hardware (see lib/capabilities.ps1). A missing GPU is a skip with a recorded
+# reason, never a failure — and never a silent pass either.
 param (
-    [string]$Workspace = $(throw "Workspace path is required")
+    [string]$Workspace = $(throw "Workspace path is required"),
+    [string]$Platform = 'windows-x86_64',
+    [string]$JsonReport = ''
 )
+
+$HERE = Split-Path -Parent $PSCommandPath
+. "$HERE/lib/capabilities.ps1"
+. "$HERE/lib/report.ps1"
+
+Report-Init -Platform $Platform
 
 $TOTAL_WIDTH_TEXT = 54
 $script:TOTAL_TESTS = 0
@@ -19,21 +32,14 @@ $AssSubPath = $AssSubPath -replace ':','\\:'
 Remove-Item -Recurse -Force -Path $TestRoot -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $TestRoot -ErrorAction SilentlyContinue | Out-Null
 
+# Counts the call sites at the bottom of this file so the progress counter can
+# read "[3/26]". Anchored at line start so the definitions above never count.
 function get_test_runs_count {
-    param (
-        [string]$searchString
-    )
-    $filePath = $PSCommandPath
-    $fileContent = Get-Content -Path $filePath -Raw
-    $_matches = [regex]::Matches($fileContent, [regex]::Escape($searchString))
-    $matches_count = $_matches.Count
-    if ( $matches_count -gt 0 ) {
-        $matches_count--
-    }
-    return $matches_count
+    $lines = Get-Content -Path $PSCommandPath
+    return @($lines | Where-Object { $_ -match '^(run_test|run_hw_test) "' }).Count
 }
 
-$TOTAL_RUNS = get_test_runs_count -searchString 'run_test "'
+$TOTAL_RUNS = get_test_runs_count
 
 function generate_samples {
     $Total_Count = 0
@@ -130,43 +136,51 @@ function run_test {
     text_with_padding "🧪 Testing ${name}" "[$script:TOTAL_TESTS/$TOTAL_RUNS]"
     $Start_Time = Get-Date
     $test_output = Invoke-Expression "$Workspace\ffmpeg.exe $command 2>&1" | Out-String
-    if ( $LASTEXITCODE -eq 0 -and $test_output -cmatch $expected_output ) {
-        $End_Time = Get-Date
-        text_with_padding "✅ ${name} test passed" "[ $((New-TimeSpan -Start $Start_Time -End $End_Time).Seconds)s ]" 1
+    $exit_code = $LASTEXITCODE
+    $duration = [int](New-TimeSpan -Start $Start_Time -End (Get-Date)).TotalSeconds
+
+    if ( $exit_code -eq 0 -and $test_output -cmatch $expected_output ) {
+        text_with_padding "✅ ${name} test passed" "[ ${duration}s ]" 1
         $script:PASSED_TESTS++
+        Report-Add -Name $name -Status passed -DurationSeconds $duration
     }
     else {
-        $End_Time = Get-Date
-        text_with_padding "❌ ${name} test failed" "[ $((New-TimeSpan -Start $Start_Time -End $End_Time).Seconds)s ]" 1
+        text_with_padding "❌ ${name} test failed" "[ ${duration}s ]" 1
         $script:FAILED_TESTS++
+        # Print the diagnosis. A red run that swallows its own output costs
+        # another full round trip on whichever machine happens to own it.
+        Write-Host "   exit=${exit_code}, expected to match: ${expected_output}"
+        $tail = ($test_output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 12)
+        $tail | ForEach-Object { Write-Host "   | $_" }
+        $short = (($test_output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 3) -join ' ')
+        Report-Add -Name $name -Status failed -DurationSeconds $duration -Reason "exit ${exit_code}; ${short}"
     }
 }
 
-function test_support {
+# Same contract as run_test, but the encoder only runs when the host owns the
+# hardware. Absent hardware skips WITH the reason recorded, so a skip can be
+# audited later instead of being indistinguishable from a pass.
+function run_hw_test {
     param (
-        [ValidateSet("AMF", "VPL")]
-        [string]$Feature
+        $name,
+        $capability,
+        $command,
+        $expected_output
     )
 
-    # Vraag video controllers op (eenmalig, wel zo efficiënt)
-    $gpus = Get-CimInstance Win32_VideoController
-
-    if ($Feature -eq "AMF") {
-        $hasAmdGpu = $gpus | Where-Object { $_.DriverProvider -like "*AMD*" -or $_.Caption -like "*AMD*" -or $_.Caption -like "*Radeon*" }
-        $hasAmfDll = Test-Path "$env:SystemRoot\System32\amfrt64.dll"
-        
-        return [bool]($hasAmdGpu -and $hasAmfDll)
-    }
-    elseif ($Feature -eq "VPL") {
-        $hasIntelGpu = $gpus | Where-Object { $_.DriverProvider -like "*Intel*" -or $_.Caption -like "*Intel*" }
-        $hasVplDll = (Test-Path "$env:SystemRoot\System32\libvplintel_preview64.dll") -or 
-                     (Test-Path "$env:SystemRoot\System32\mfxplugin64.dll") -or 
-                     (Test-Path "$env:SystemRoot\System32\libvpl.dll")
-        
-        return [bool]($hasIntelGpu -and $hasVplDll)
+    $reason = Hw-CapabilityReason -Feature $capability
+    if (-not $reason) {
+        run_test $name $command $expected_output
+        return
     }
 
-    return $false
+    $script:TOTAL_TESTS++
+    $name = $name.ToUpper()
+    text_with_padding "🧪 Testing ${name}" "[$script:TOTAL_TESTS/$TOTAL_RUNS]"
+    text_with_padding "➖ ${name} was skipped" "[ 0s ]" 1
+    Write-Host "   $reason"
+    $script:SKIPPED_TESTS++
+    Report-Add -Name $name -Status skipped -DurationSeconds 0 -Reason $reason
 }
 
 # Main execution
@@ -192,28 +206,11 @@ run_test "libopenjpeg" "-y -i $SampleImage -c:v libopenjpeg $TestRoot\test_jp2.j
 run_test "libass" "-y -i '${SampleVideo}' -vf ass='${AssSubPath}' '${TestRoot}/test_ass.mp4'" "ass"
 run_test "auto_mkdir" "-y -f lavfi -i `"testsrc=duration=1:size=320x240:rate=1`" -frames:v 1 $TestRoot\subdir_test\nested\output.png" "output.png"
 
-# Hardware acceleration (may fail if no hardware support)
-run_test "NVENC" "-y -i $SampleVideo -c:v h264_nvenc $TestRoot\test_nvenc.mp4" "nvenc"
-# Check for Intel GPU/driver otherwise skip
-if (test_support "VPL") {
-    run_test "VPL" "-y -i $SampleVideo -c:v h264_vpl $TestRoot\test_vpl.mp4" "vpl"
-}
-else {
-    $script:TOTAL_TESTS++
-    text_with_padding "🧪 Testing VPL" "[$script:TOTAL_TESTS/$TOTAL_RUNS]"
-    text_with_padding "➖ VPL was skipped" "[ 0s ]" 1
-    $script:SKIPPED_TESTS++
-}
-# Check for AMD GPU/driver otherwise skip
-if (test_support "AMF") {
-    run_test "AMF" "-y -i $SampleVideo -c:v h264_amf $TestRoot\test_amf.mp4" "amf"
-}
-else {
-    $script:TOTAL_TESTS++
-    text_with_padding "🧪 Testing AMF" "[$script:TOTAL_TESTS/$TOTAL_RUNS]"
-    text_with_padding "➖ AMF was skipped" "[ 0s ]" 1
-    $script:SKIPPED_TESTS++
-}
+# Hardware acceleration — each runs only where the hardware exists.
+run_hw_test "NVENC" nvenc "-y -i $SampleVideo -c:v h264_nvenc $TestRoot\test_nvenc.mp4" "nvenc"
+run_hw_test "VPL" vpl "-y -i $SampleVideo -c:v h264_vpl $TestRoot\test_vpl.mp4" "vpl"
+run_hw_test "AMF" amf "-y -i $SampleVideo -c:v h264_amf $TestRoot\test_amf.mp4" "amf"
+run_hw_test "VIDEOTOOLBOX" videotoolbox "-y -i $SampleVideo -c:v h264_videotoolbox $TestRoot\test_vt.mp4" "videotoolbox"
 
 # Additional format tests
 run_test "libbluray" "-hide_banner -protocols | findstr bluray" "bluray"
@@ -239,6 +236,11 @@ text_with_padding "Failed tests:" "$script:FAILED_TESTS"
 text_with_padding "Total tests:" "$script:TOTAL_TESTS"
 Write-Host ([string]::new('-', $TOTAL_WIDTH_TEXT))
 Write-Host ""
+
+if ($JsonReport) {
+    Report-Write -Path $JsonReport -Binary "$Workspace\ffmpeg.exe"
+    Write-Host "📄 Report written to $JsonReport"
+}
 
 Remove-Item -Recurse -Force -Path $TestRoot -ErrorAction SilentlyContinue
 
