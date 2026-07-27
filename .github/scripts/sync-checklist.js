@@ -214,6 +214,20 @@ function main() {
 
   const comment = buildComment(results, hardware, context);
 
+  // Rehearsal mode: prove the whole pipeline — runners, artifacts, verdicts and
+  // the tick decision — without editing someone's open release PR.
+  if (process.env.DRY_RUN === 'true') {
+    console.log('── DRY RUN — nothing will be written to the PR ──\n');
+    console.log(comment);
+    console.log('\n── checklist that would be written ──');
+    for (const [platform, { assessment }] of results) {
+      console.log(`  [${assessment.ok ? 'x' : ' '}] ${platform}${assessment.ok ? '' : ` — ${assessment.why}`}`);
+    }
+    console.log(`  [${hardware.ok ? 'x' : ' '}] hardware acceleration`);
+    console.log(updated === body ? '\nPR body unchanged.' : '\nPR body would change.');
+    return;
+  }
+
   if (updated !== body) {
     gh(['pr', 'edit', context.pr, '--repo', context.repo, '--body-file', '-'], updated);
     console.log('✅ PR checklist updated.');

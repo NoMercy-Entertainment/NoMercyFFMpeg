@@ -21,6 +21,11 @@ on:
         description: 'PR number to verify'
         required: true
         type: string
+      dry_run:
+        description: 'Report what would be ticked without editing the PR'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: verify-rc-${{ github.event.workflow_run.head_sha || inputs.pr }}
@@ -341,4 +346,5 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
           HEAD_SHA: ${{ needs.resolve.outputs.head-sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: node .github/scripts/sync-checklist.js verdicts
