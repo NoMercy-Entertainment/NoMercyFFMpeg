@@ -106,3 +106,27 @@ assert.match(rewritten, /- \[ \] a stray box below/, 'leaves boxes below the mar
 assert.strictEqual(rewriteChecklist('no markers', () => true), null, 'refuses a body with no delimiters');
 
 console.log('all sync-checklist tests passed');
+
+// ── Verdicts must be found however the artifacts were laid out ────────────
+// download-artifact flattens; `gh run download` nests one folder per artifact.
+// A non-recursive read of the nested layout finds nothing and would report every
+// healthy platform as unverified.
+const fs = require('fs');
+const os = require('os');
+const pathModule = require('path');
+const { readVerdicts } = require('./sync-checklist');
+
+const root = fs.mkdtempSync(pathModule.join(os.tmpdir(), 'verdicts-'));
+fs.writeFileSync(pathModule.join(root, 'verdict-flat.json'), JSON.stringify({ platform: 'linux-x86_64' }));
+const nested = pathModule.join(root, 'verdict-darwin-arm64');
+fs.mkdirSync(nested);
+fs.writeFileSync(pathModule.join(nested, 'verdict-darwin-arm64.json'), JSON.stringify({ platform: 'darwin-arm64' }));
+
+const discovered = readVerdicts(root);
+assert.strictEqual(discovered.size, 2, 'finds both flat and nested verdicts');
+assert.ok(discovered.has('linux-x86_64'), 'finds the flat verdict');
+assert.ok(discovered.has('darwin-arm64'), 'finds the nested verdict');
+assert.strictEqual(readVerdicts(pathModule.join(root, 'missing')).size, 0, 'a missing directory yields nothing');
+fs.rmSync(root, { recursive: true, force: true });
+
+console.log('verdict discovery tests passed');

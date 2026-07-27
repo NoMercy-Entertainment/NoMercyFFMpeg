@@ -23,17 +23,31 @@ const PLATFORM_LINE = /^(linux-x86_64|linux-aarch64|windows-x86_64|darwin-x86_64
 const HARDWARE_LINE = /hardware acceleration/i;
 const ACCELERATORS = ['nvenc', 'amf', 'vpl', 'videotoolbox'];
 
+// Walks nested directories on purpose. download-artifact flattens with
+// merge-multiple, but `gh run download` gives every artifact its own folder —
+// and a non-recursive read of that layout finds nothing, silently leaves every
+// box unticked, and reports six healthy platforms as unverified.
+function findVerdictFiles(directory) {
+  const found = [];
+  if (!fs.existsSync(directory)) return found;
+
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const full = path.join(directory, entry.name);
+    if (entry.isDirectory()) found.push(...findVerdictFiles(full));
+    else if (entry.name.endsWith('.json')) found.push(full);
+  }
+  return found;
+}
+
 function readVerdicts(directory) {
   const verdicts = new Map();
-  if (!fs.existsSync(directory)) return verdicts;
 
-  for (const entry of fs.readdirSync(directory)) {
-    if (!entry.endsWith('.json')) continue;
+  for (const file of findVerdictFiles(directory)) {
     let parsed;
     try {
-      parsed = JSON.parse(fs.readFileSync(path.join(directory, entry), 'utf8'));
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (error) {
-      console.error(`⚠️  ${entry}: unreadable (${error.message}) — treated as missing`);
+      console.error(`⚠️  ${path.basename(file)}: unreadable (${error.message}) — treated as missing`);
       continue;
     }
     if (parsed && parsed.platform) verdicts.set(parsed.platform, parsed);
@@ -262,4 +276,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { assess, assessHardware, rewriteChecklist, buildComment };
+module.exports = { assess, assessHardware, rewriteChecklist, buildComment, readVerdicts };
