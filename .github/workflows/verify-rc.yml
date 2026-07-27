@@ -169,15 +169,16 @@ jobs:
           mkdir -p rc
 
           # python3 rather than jq: jq is absent from a stock macOS runner,
-          # python3 is present on every host in this fleet.
+          # python3 is present on every host in this fleet. The variables are
+          # passed as environment, which must precede the command — trailing
+          # NAME=value would be argv and never reach os.environ.
           asset_url() {
-            printf '%s' "$ASSETS" | python3 -c \
-              "import json,sys,os; print(next((a['url'] for a in json.load(sys.stdin) if a['name']==os.environ['N']),''))" N="$1"
+            printf '%s' "$ASSETS" | N="$1" python3 -c \
+              "import json,sys,os; print(next((a['url'] for a in json.load(sys.stdin) if a['name']==os.environ['N']),''))"
           }
 
-          ARCHIVE=$(printf '%s' "$ASSETS" | python3 -c \
-            "import json,sys,os; print(next((a['name'] for a in json.load(sys.stdin) if os.environ['P'] in a['name'] and a['name'].endswith(os.environ['E'])),''))" \
-            P="$PLATFORM" E="$EXT")
+          ARCHIVE=$(printf '%s' "$ASSETS" | P="$PLATFORM" E="$EXT" python3 -c \
+            "import json,sys,os; print(next((a['name'] for a in json.load(sys.stdin) if os.environ['P'] in a['name'] and a['name'].endswith(os.environ['E'])),''))")
           [[ -n "$ARCHIVE" ]] || { echo "::error::no ${PLATFORM} archive in ${TAG}"; exit 1; }
 
           for name in "$ARCHIVE" manifest.json; do
