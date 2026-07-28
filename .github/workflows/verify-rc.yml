@@ -1,0 +1,366 @@
+name: Verify RC
+
+# Runs the full manual suite against a Release Candidate on real hardware, one
+# job per checklist line, and ticks only the boxes whose hardware actually
+# reported a pass.
+#
+# This replaces a human downloading six archives and running six scripts. It is
+# deliberately NOT a rubber stamp: a box is ticked from the verdict artifact a
+# runner produced, never from a job's exit status, and every verdict names the
+# SHA-256 of the bytes it tested. If a platform's runner is offline, its box
+# stays empty and the merge stays blocked — the same outcome as nobody testing
+# it, which is the honest one.
+
+on:
+  workflow_run:
+    workflows: ["CI/CD Pipeline"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR number to verify'
+        required: true
+        type: string
+      dry_run:
+        description: 'Report what would be ticked without editing the PR'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: verify-rc-${{ github.event.workflow_run.head_sha || inputs.pr }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ── Work out which PR and which RC we are verifying ───────────────────────
+  # Everything downstream is pinned to the head SHA resolved here, so a verify
+  # run that started against an older push can never tick boxes for a newer one.
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.resolve.outputs.should-run }}
+      pr: ${{ steps.resolve.outputs.pr }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      head-sha: ${{ steps.resolve.outputs.head-sha }}
+      assets: ${{ steps.resolve.outputs.assets }}
+    steps:
+      - name: Resolve PR and Release Candidate
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          INPUT_PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT" == "workflow_run" ]]; then
+            # workflow_run executes in the BASE repository, with its secrets and
+            # its token, whatever the triggering run belonged to. The verify job
+            # then checks out a ref and runs the suite from it on the fleet, so
+            # a fork-triggered run would be fork-controlled code on physical
+            # machines here. The RC-matching check further down happens to stop
+            # it today, which is luck rather than a rule. This is the rule.
+            if [[ -n "$RUN_HEAD_REPO" && "$RUN_HEAD_REPO" != "$REPO" ]]; then
+              echo "Build came from ${RUN_HEAD_REPO}, not ${REPO} — refusing to verify a fork on self-hosted hardware."
+              echo "should-run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$RUN_EVENT" != "pull_request" || "$RUN_CONCLUSION" != "success" ]]; then
+              echo "Build was ${RUN_CONCLUSION} on a ${RUN_EVENT} event — nothing to verify."
+              echo "should-run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # PRs into master are only accepted from dev (pr-guards enforces it),
+            # so the open dev->master PR is unambiguous. Restricted to PRs whose
+            # head is in THIS repository: --head matches on branch name alone, so
+            # a fork with a branch called dev would otherwise be a candidate.
+            PR=$(gh pr list --repo "$REPO" --head dev --base master --state open \
+                   --json number,headRepositoryOwner,isCrossRepository \
+                   --jq "[.[] | select(.isCrossRepository == false)][0].number // empty")
+          else
+            PR="$INPUT_PR"
+          fi
+
+          if [[ -z "$PR" ]]; then
+            echo "No open dev->master PR — nothing to verify."
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          HEAD_SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+
+          # The RC is republished on every PR push. Only accept the one built
+          # from exactly this head, or we would test yesterday's binaries and
+          # tick today's checklist.
+          TAG=$(gh release list --repo "$REPO" --limit 30 --json tagName,isPrerelease \
+                  --jq '[.[] | select(.isPrerelease)][0].tagName // empty')
+          if [[ -z "$TAG" ]]; then
+            echo "::error::No prerelease found to verify."
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TARGET=$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.target_commitish')
+          if [[ "$TARGET" != "$HEAD_SHA" ]]; then
+            echo "::warning::RC ${TAG} was built from ${TARGET} but PR #${PR} head is ${HEAD_SHA} — skipping."
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Emit the asset id map once so every runner can fetch by API URL,
+          # which works the same whether the repo is public or private.
+          ASSETS=$(gh api "repos/${REPO}/releases/tags/${TAG}" \
+            --jq '[.assets[] | {name: .name, url: .url}] | tojson')
+
+          {
+            echo "should-run=true"
+            echo "pr=${PR}"
+            echo "tag=${TAG}"
+            echo "head-sha=${HEAD_SHA}"
+            echo "assets=${ASSETS}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Verifying PR #${PR} @ ${HEAD_SHA} against ${TAG}"
+
+  # ── One job per checklist platform, each on its own real machine ──────────
+  verify:
+    needs: resolve
+    if: needs.resolve.outputs.should-run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            ext: tar.gz
+            labels: '["self-hosted","ffmpeg-verify","linux-x86_64"]'
+            via: native
+          - platform: linux-aarch64
+            ext: tar.gz
+            labels: '["self-hosted","ffmpeg-verify","linux-aarch64"]'
+            via: lima
+          - platform: darwin-arm64
+            ext: tar.gz
+            labels: '["self-hosted","ffmpeg-verify","darwin-arm64"]'
+            via: native
+          - platform: darwin-x86_64
+            ext: tar.gz
+            labels: '["self-hosted","ffmpeg-verify","darwin-x86_64"]'
+            via: native
+          - platform: freebsd-x86_64
+            ext: tar.gz
+            labels: '["self-hosted","ffmpeg-verify","freebsd-driver"]'
+            via: ssh
+          - platform: windows-x86_64
+            ext: zip
+            labels: '["self-hosted","ffmpeg-verify","windows-x86_64"]'
+            via: windows
+    runs-on: ${{ fromJSON(matrix.labels) }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.head-sha }}
+
+      - name: Download RC asset and manifest (unix)
+        if: matrix.via != 'windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSETS: ${{ needs.resolve.outputs.assets }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PLATFORM: ${{ matrix.platform }}
+          EXT: ${{ matrix.ext }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p rc
+
+          # python3 rather than jq: jq is absent from a stock macOS runner,
+          # python3 is present on every host in this fleet. The variables are
+          # passed as environment, which must precede the command — trailing
+          # NAME=value would be argv and never reach os.environ.
+          asset_url() {
+            printf '%s' "$ASSETS" | N="$1" python3 -c \
+              "import json,sys,os; print(next((a['url'] for a in json.load(sys.stdin) if a['name']==os.environ['N']),''))"
+          }
+
+          ARCHIVE=$(printf '%s' "$ASSETS" | P="$PLATFORM" E="$EXT" python3 -c \
+            "import json,sys,os; print(next((a['name'] for a in json.load(sys.stdin) if os.environ['P'] in a['name'] and a['name'].endswith(os.environ['E'])),''))")
+          [[ -n "$ARCHIVE" ]] || { echo "::error::no ${PLATFORM} archive in ${TAG}"; exit 1; }
+
+          for name in "$ARCHIVE" manifest.json; do
+            url=$(asset_url "$name")
+            [[ -n "$url" ]] || { echo "::error::asset ${name} not in release ${TAG}"; exit 1; }
+            curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/octet-stream" "$url" -o "rc/${name}"
+          done
+
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+          ls -lh rc/
+
+      - name: Verify natively
+        if: matrix.via == 'native'
+        shell: bash
+        run: |
+          bash tests/verify-rc.sh \
+            --archive "rc/${ARCHIVE}" \
+            --manifest rc/manifest.json \
+            --platform "${{ matrix.platform }}" \
+            --workdir "${RUNNER_TEMP}/ffmpeg-${{ matrix.platform }}" \
+            --json "verdict-${{ matrix.platform }}.json" \
+            --tag "${{ needs.resolve.outputs.tag }}" \
+            --commit "${{ needs.resolve.outputs.head-sha }}"
+
+      # linux-aarch64 has no dedicated machine — it runs in a native ARM Linux
+      # guest on the Apple Silicon host, which is real aarch64 silicon rather
+      # than emulation.
+      - name: Verify inside the Lima guest
+        if: matrix.via == 'lima'
+        env:
+          LIMA_INSTANCE: ${{ vars.VERIFY_LIMA_INSTANCE }}
+          LIMA_BIN: ${{ vars.VERIFY_LIMA_BIN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${LIMA_INSTANCE}" ]] || { echo "::error::repo variable VERIFY_LIMA_INSTANCE is not set"; exit 1; }
+          LIMACTL="${LIMA_BIN:-limactl}"
+          REMOTE="/tmp/ffmpeg-verify-${GITHUB_RUN_ID}"
+
+          "$LIMACTL" shell "$LIMA_INSTANCE" -- rm -rf "$REMOTE"
+          "$LIMACTL" shell "$LIMA_INSTANCE" -- mkdir -p "$REMOTE/rc"
+          "$LIMACTL" copy -r tests "${LIMA_INSTANCE}:${REMOTE}/tests"
+          "$LIMACTL" copy "rc/${ARCHIVE}" "${LIMA_INSTANCE}:${REMOTE}/rc/${ARCHIVE}"
+          "$LIMACTL" copy rc/manifest.json "${LIMA_INSTANCE}:${REMOTE}/rc/manifest.json"
+
+          # set +e so a failing suite still lets us retrieve the verdict below;
+          # under set -e the step would abort and the evidence would be lost.
+          set +e
+          "$LIMACTL" shell "$LIMA_INSTANCE" -- bash "${REMOTE}/tests/verify-rc.sh" \
+            --archive "${REMOTE}/rc/${ARCHIVE}" \
+            --manifest "${REMOTE}/rc/manifest.json" \
+            --platform "${{ matrix.platform }}" \
+            --workdir "${REMOTE}/w" \
+            --json "${REMOTE}/verdict.json" \
+            --tag "${{ needs.resolve.outputs.tag }}" \
+            --commit "${{ needs.resolve.outputs.head-sha }}"
+          status=$?
+          set -e
+
+          "$LIMACTL" copy "${LIMA_INSTANCE}:${REMOTE}/verdict.json" "verdict-${{ matrix.platform }}.json"
+          "$LIMACTL" shell "$LIMA_INSTANCE" -- rm -rf "$REMOTE"
+          exit $status
+
+      # FreeBSD has no official Actions runner build, so a Linux runner drives a
+      # real FreeBSD guest over SSH. The suite still executes on FreeBSD.
+      - name: Verify over SSH on the FreeBSD guest
+        if: matrix.via == 'ssh'
+        env:
+          SSH_TARGET: ${{ vars.VERIFY_FREEBSD_SSH_TARGET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${SSH_TARGET}" ]] || { echo "::error::repo variable VERIFY_FREEBSD_SSH_TARGET is not set"; exit 1; }
+          SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          REMOTE="/tmp/ffmpeg-verify-${GITHUB_RUN_ID}"
+
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$SSH_TARGET" "rm -rf ${REMOTE}; mkdir -p ${REMOTE}/rc"
+          tar -cf - tests | ssh $SSH_OPTS "$SSH_TARGET" "tar -xf - -C ${REMOTE}"
+          scp $SSH_OPTS "rc/${ARCHIVE}" rc/manifest.json "${SSH_TARGET}:${REMOTE}/rc/"
+
+          set +e
+          ssh $SSH_OPTS "$SSH_TARGET" "bash ${REMOTE}/tests/verify-rc.sh \
+            --archive ${REMOTE}/rc/${ARCHIVE} \
+            --manifest ${REMOTE}/rc/manifest.json \
+            --platform ${{ matrix.platform }} \
+            --workdir ${REMOTE}/w \
+            --json ${REMOTE}/verdict.json \
+            --tag ${{ needs.resolve.outputs.tag }} \
+            --commit ${{ needs.resolve.outputs.head-sha }}"
+          status=$?
+          set -e
+
+          scp $SSH_OPTS "${SSH_TARGET}:${REMOTE}/verdict.json" "verdict-${{ matrix.platform }}.json"
+          ssh $SSH_OPTS "$SSH_TARGET" "rm -rf ${REMOTE}" || true
+          exit $status
+
+      - name: Download RC asset and manifest (windows)
+        if: matrix.via == 'windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSETS: ${{ needs.resolve.outputs.assets }}
+          PLATFORM: ${{ matrix.platform }}
+          EXT: ${{ matrix.ext }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path rc -Force | Out-Null
+          $assets = $env:ASSETS | ConvertFrom-Json
+          $archive = ($assets | Where-Object { $_.name -like "*$($env:PLATFORM)*" -and $_.name.EndsWith($env:EXT) } | Select-Object -First 1)
+          if (-not $archive) { throw "no $($env:PLATFORM) archive in the release" }
+          $manifest = ($assets | Where-Object { $_.name -eq 'manifest.json' } | Select-Object -First 1)
+          $headers = @{ Authorization = "Bearer $($env:GH_TOKEN)"; Accept = 'application/octet-stream' }
+          Invoke-WebRequest -Uri $archive.url -Headers $headers -OutFile "rc/$($archive.name)" -UseBasicParsing
+          Invoke-WebRequest -Uri $manifest.url -Headers $headers -OutFile 'rc/manifest.json' -UseBasicParsing
+          "ARCHIVE=$($archive.name)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify natively (windows)
+        if: matrix.via == 'windows'
+        shell: pwsh
+        run: |
+          ./tests/verify-rc.ps1 `
+            -Archive "rc/$env:ARCHIVE" `
+            -Manifest rc/manifest.json `
+            -Platform '${{ matrix.platform }}' `
+            -WorkDir "$env:RUNNER_TEMP\ffmpeg-${{ matrix.platform }}" `
+            -Json "verdict-${{ matrix.platform }}.json" `
+            -Tag '${{ needs.resolve.outputs.tag }}' `
+            -Commit '${{ needs.resolve.outputs.head-sha }}'
+
+      # always() so a failing platform still uploads its verdict — the evidence
+      # comment needs to say WHICH test failed, not just that something did.
+      - name: Upload verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verdict-${{ matrix.platform }}
+          path: verdict-${{ matrix.platform }}.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ── Tick the checklist from the verdicts, and only from the verdicts ──────
+  sync-checklist:
+    needs: [resolve, verify]
+    if: always() && needs.resolve.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.head-sha }}
+
+      - name: Download all verdicts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: verdict-*
+          path: verdicts
+          merge-multiple: true
+
+      - name: Sync the PR checklist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head-sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: node .github/scripts/sync-checklist.js verdicts

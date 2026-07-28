@@ -1,10 +1,15 @@
 name: PR Guards
 
-# Fast, build-free gates for PRs into master. `edited` is included so the
-# checklist re-evaluates the moment a reviewer ticks a box.
+# Fast, build-free gates. `edited` is included so the checklist re-evaluates
+# the moment a reviewer ticks a box.
+#
+# dev is here as well as master because work reaches master through dev, so a
+# master-only trigger means the scripts that decide whether a merge-blocking box
+# gets ticked are first tested on the PR that is already using them. The two
+# master-only gates below stay master-only.
 on:
   pull_request:
-    branches: [master]
+    branches: [master, dev]
     types: [opened, edited, synchronize, reopened]
 
 concurrency:
@@ -13,6 +18,7 @@ concurrency:
 
 jobs:
   guard-source-branch:
+    if: github.base_ref == 'master'
     runs-on: ubuntu-latest
     steps:
       - name: Enforce PR source branch is dev
@@ -25,7 +31,25 @@ jobs:
           fi
           echo "✅ PR source branch is dev."
 
+  # The checklist scripts decide whether a merge-blocking box gets ticked, so
+  # their refusal paths are the guarantee. Nothing was running these tests, and
+  # a regression in them is silent by construction: the failure mode is a box
+  # that ticks when it should not.
+  checklist-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test the checklist scripts
+        run: |
+          node .github/scripts/sync-checklist.test.js
+          node .github/scripts/check-checklist.test.js
+
   checklist-complete:
+    if: github.base_ref == 'master'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,7 +63,7 @@ jobs:
   # checks so a failed/ skipped dependency reliably fails this job (a job
   # skipped via failed `needs` can otherwise be miscounted as passing).
   pr-validation:
-    needs: [guard-source-branch, checklist-complete]
+    needs: [guard-source-branch, checklist-complete, checklist-scripts]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -47,6 +71,29 @@ jobs:
         run: |
           guard='${{ needs.guard-source-branch.result }}'
           checklist='${{ needs.checklist-complete.result }}'
+          scripts='${{ needs.checklist-scripts.result }}'
+          base='${{ github.base_ref }}'
+
+          # Runs for every base, so it is never allowed to be skipped.
+          if [[ "$scripts" != "success" ]]; then
+            echo "❌ The checklist scripts' own tests did not pass (got '$scripts')."
+            exit 1
+          fi
+
+          # The other two are master-only by design. On a dev PR they report
+          # 'skipped', which is the correct outcome rather than a pass to be
+          # waved through — so it is accepted here for dev and nowhere else.
+          if [[ "$base" != "master" ]]; then
+            for name in guard:"$guard" checklist:"$checklist"; do
+              if [[ "${name#*:}" != "skipped" ]]; then
+                echo "❌ ${name%%:*} should have been skipped on a ${base} PR, got '${name#*:}'."
+                exit 1
+              fi
+            done
+            echo "✅ Script tests passed; the master-only gates correctly did not run."
+            exit 0
+          fi
+
           if [[ "$guard" != "success" || "$checklist" != "success" ]]; then
             echo "❌ PR gates failed: guard=$guard checklist=$checklist"
             exit 1
