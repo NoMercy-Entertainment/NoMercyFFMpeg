@@ -56,20 +56,35 @@ jobs:
           EVENT: ${{ github.event_name }}
           RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           INPUT_PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
 
           if [[ "$EVENT" == "workflow_run" ]]; then
+            # workflow_run executes in the BASE repository, with its secrets and
+            # its token, whatever the triggering run belonged to. The verify job
+            # then checks out a ref and runs the suite from it on the fleet, so
+            # a fork-triggered run would be fork-controlled code on physical
+            # machines here. The RC-matching check further down happens to stop
+            # it today, which is luck rather than a rule. This is the rule.
+            if [[ -n "$RUN_HEAD_REPO" && "$RUN_HEAD_REPO" != "$REPO" ]]; then
+              echo "Build came from ${RUN_HEAD_REPO}, not ${REPO} — refusing to verify a fork on self-hosted hardware."
+              echo "should-run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             if [[ "$RUN_EVENT" != "pull_request" || "$RUN_CONCLUSION" != "success" ]]; then
               echo "Build was ${RUN_CONCLUSION} on a ${RUN_EVENT} event — nothing to verify."
               echo "should-run=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             # PRs into master are only accepted from dev (pr-guards enforces it),
-            # so the open dev->master PR is unambiguous.
+            # so the open dev->master PR is unambiguous. Restricted to PRs whose
+            # head is in THIS repository: --head matches on branch name alone, so
+            # a fork with a branch called dev would otherwise be a candidate.
             PR=$(gh pr list --repo "$REPO" --head dev --base master --state open \
-                   --json number --jq '.[0].number // empty')
+                   --json number,headRepositoryOwner,isCrossRepository \
+                   --jq "[.[] | select(.isCrossRepository == false)][0].number // empty")
           else
             PR="$INPUT_PR"
           fi
