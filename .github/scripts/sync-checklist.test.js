@@ -66,12 +66,13 @@ assert.strictEqual(
 );
 
 // ── Hardware line ─────────────────────────────────────────────────────────
-// assessHardware now takes verdicts assess() has ALREADY accepted, so these
-// build the accepted shape rather than a raw map. Building them any other way
-// would have the tests assert the permissive behaviour as the specification.
-const withTests = (platform, tests) => [{ platform, report: { tests } }];
+// assessHardware takes the ASSESSED results, so these build that shape. A raw
+// verdict map no longer satisfies it, which is what stops the permissive
+// behaviour being written down here as the specification.
+const accepted = (platform, tests) =>
+  new Map([[platform, { verdict: { platform, report: { tests } }, assessment: { ok: true } }]]);
 
-let hw = assessHardware(withTests('windows-x86_64', [
+let hw = assessHardware(accepted('windows-x86_64', [
   { name: 'NVENC', status: 'passed' },
   { name: 'AMF', status: 'skipped', reason: 'no AMD display adapter' },
 ]));
@@ -79,13 +80,13 @@ assert.strictEqual(hw.ok, true, 'one real accelerator satisfies the hardware lin
 assert.deepStrictEqual(hw.exercised, ['nvenc on windows-x86_64'], 'names what actually ran');
 assert.strictEqual(hw.unavailable.length, 1, 'records what could not be tested');
 
-hw = assessHardware(withTests('linux-x86_64', [
+hw = assessHardware(accepted('linux-x86_64', [
   { name: 'NVENC', status: 'skipped', reason: 'no NVIDIA adapter' },
   { name: 'AMF', status: 'skipped', reason: 'no AMD adapter' },
 ]));
 assert.strictEqual(hw.ok, false, 'all-skipped acceleration does not satisfy the line');
 
-hw = assessHardware(withTests('windows-x86_64', [{ name: 'NVENC', status: 'failed' }]));
+hw = assessHardware(accepted('windows-x86_64', [{ name: 'NVENC', status: 'failed' }]));
 assert.strictEqual(hw.ok, false, 'a failed accelerator fails the line');
 
 // ── Rewriting is confined to the delimited section ────────────────────────
@@ -137,13 +138,32 @@ assert.strictEqual(assess({ ...passingVerdict(), tag: '' }, CONTEXT).ok, false,
 
 // ── The hardware line inherits every refusal assess() makes ───────────────
 // A verdict assess() rejected must not tick the hardware box by another route.
+// The linkage itself, not just the empty case: a verdict carrying a PASSING
+// accelerator that assess() refused must not satisfy the hardware line.
 const rejected = { ...passingVerdict(), commit: 'deadbeef', platform: 'windows-x86_64' };
-rejected.report.tests = [{ name: 'NVENC', status: 'passed' }];
-assert.strictEqual(assess(rejected, CONTEXT).ok, false, 'stale commit is refused');
-assert.strictEqual(assessHardware([]).ok, false,
-  'with no accepted verdicts the hardware line cannot be satisfied');
+rejected.report = { ...rejected.report, tests: [{ name: 'NVENC', status: 'passed' }] };
+const rejectedAssessment = assess(rejected, CONTEXT);
+assert.strictEqual(rejectedAssessment.ok, false, 'stale commit is refused');
 
+const mixed = new Map([
+  ['windows-x86_64', { verdict: rejected, assessment: rejectedAssessment }],
+]);
+assert.strictEqual(assessHardware(mixed).ok, false,
+  'a passing accelerator inside a REFUSED verdict does not tick the hardware line');
+assert.deepStrictEqual(assessHardware(mixed).exercised, [],
+  'and it is not even reported as exercised');
 
+// The same verdict, accepted, does satisfy it - so the filter has not
+// overshot into refusing everything.
+const okAssessment = { ok: true };
+const sameButAccepted = new Map([
+  ['windows-x86_64', { verdict: rejected, assessment: okAssessment }],
+]);
+assert.strictEqual(assessHardware(sameButAccepted).ok, true,
+  'the identical verdict, once accepted, satisfies the hardware line');
+
+assert.strictEqual(assessHardware(new Map()).ok, false,
+  'with no verdicts at all the hardware line cannot be satisfied');
 console.log('all sync-checklist tests passed');
 
 // ── Verdicts must be found however the artifacts were laid out ────────────

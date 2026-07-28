@@ -95,14 +95,21 @@ function assess(verdict, expected) {
 // The hardware line covers NVENC / AMF / VPL. Nothing in the fleet can
 // positively exercise AMF or VPL, so it is satisfied by at least one
 // accelerator genuinely encoding, with the untestable ones reported as such.
-// Takes only the verdicts assess() already accepted. Reading the raw map here
-// would let a verdict this script refused for a platform box still tick the
-// hardware box, which is the same lie by a different route.
-function assessHardware(acceptedVerdicts) {
+// Takes the ASSESSED results, not the raw verdict map, and does the filtering
+// itself. Passing accepted verdicts in from the caller worked, but it left the
+// linkage as something to remember: reading the raw map here would once again
+// let a verdict refused for a platform box tick the hardware box, which is the
+// same lie by a different route. Demanding the assessed shape makes the wrong
+// call fail rather than pass quietly.
+function assessHardware(results) {
   const exercised = [];
   const unavailable = [];
 
-  for (const verdict of acceptedVerdicts) {
+  const accepted = [...results.values()]
+    .filter((entry) => entry && entry.assessment && entry.assessment.ok && entry.verdict)
+    .map((entry) => entry.verdict);
+
+  for (const verdict of accepted) {
     for (const test of verdict.report?.tests || []) {
       const name = test.name.toLowerCase();
       if (!ACCELERATORS.includes(name)) continue;
@@ -224,10 +231,7 @@ function main() {
     const verdict = verdicts.get(platform);
     results.set(platform, { verdict, assessment: assess(verdict, context) });
   }
-  const accepted = [...results.values()]
-    .filter((r) => r.assessment.ok && r.verdict)
-    .map((r) => r.verdict);
-  const hardware = assessHardware(accepted);
+  const hardware = assessHardware(results);
 
   const body = JSON.parse(gh(['pr', 'view', context.pr, '--repo', context.repo, '--json', 'body'])).body || '';
 
