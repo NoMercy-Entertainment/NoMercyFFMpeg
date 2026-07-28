@@ -42,6 +42,14 @@ make -j$(nproc)
 
 # install x265
 mv libx265.a libx265_main.a
+
+# Member count of the 8-bit-only archive, to prove the merge below actually
+# added the other two. Existence proves nothing: an unmerged libx265.a is a
+# perfectly good archive that simply lacks x265_10bit:: and x265_12bit::, and
+# the first thing that notices is ffmpeg's configure, 25 minutes later, saying
+# "x265 not found using pkg-config" — which sends you looking at pkg-config.
+main_members=$(${AR} t libx265_main.a 2>/dev/null | wc -l)
+
 if [[ "${TARGET_OS}" == "darwin" ]]; then
     ${CROSS_PREFIX}libtool -static -o libx265.a libx265_main.a libx265_main10.a libx265_main12.a
     ${RANLIB} libx265.a
@@ -61,11 +69,39 @@ else
     fi
 fi
 
+merged_members=$(${AR} t libx265.a 2>/dev/null | wc -l)
+if [ "${merged_members}" -le "${main_members}" ]; then
+    {
+        echo "Error: the x265 multilib merge did not take."
+        echo "libx265_main.a has ${main_members} members, merged libx265.a has ${merged_members}."
+        echo "A merged archive must contain all three, or ffmpeg fails much later"
+        echo "with 'undefined symbol: x265_10bit::x265_api_get_*'."
+    } >/ffmpeg_build.log
+    exit 1
+fi
+
 make install
+
+# Put the merged archive in place AFTER install. `make install` depends on the
+# `all` target, so it can relink libx265.a from the 8-bit objects and overwrite
+# the merge that just happened — whether it does comes down to timestamps,
+# which is why this fails intermittently rather than every time.
+cp -f libx265.a ${PREFIX}/lib/libx265.a
+${RANLIB} ${PREFIX}/lib/libx265.a 2>/dev/null || true
+
 rm -rf /build/x265
 
 if [ ! -f ${PREFIX}/lib/libx265.a ]; then
     echo "Error: libx265.a is missing from lib" >/ffmpeg_build.log
+    exit 1
+fi
+
+installed_members=$(${AR} t ${PREFIX}/lib/libx265.a 2>/dev/null | wc -l)
+if [ "${installed_members}" -ne "${merged_members}" ]; then
+    {
+        echo "Error: the installed libx265.a is not the merged one."
+        echo "Merged archive has ${merged_members} members, installed has ${installed_members}."
+    } >/ffmpeg_build.log
     exit 1
 fi
 
