@@ -64,10 +64,20 @@ function assess(verdict, expected) {
     const stage = verdict.failed_stage ? `${verdict.failed_stage}: ${verdict.detail}` : '';
     return { ok: false, why: names ? `failed: ${names}` : stage || 'suite reported failure' };
   }
-  if (verdict.commit && expected.headSha && verdict.commit !== expected.headSha) {
+  // Absent is not the same as matching. These two fields are the entire reason
+  // a verdict from an older push cannot tick a box for a newer one, so a
+  // verdict that does not carry them has not proved anything about which build
+  // it tested.
+  if (!verdict.commit) {
+    return { ok: false, why: 'verdict does not say which commit it tested' };
+  }
+  if (expected.headSha && verdict.commit !== expected.headSha) {
     return { ok: false, why: `verdict is for commit ${verdict.commit.slice(0, 8)}, PR head is ${expected.headSha.slice(0, 8)}` };
   }
-  if (verdict.tag && expected.tag && verdict.tag !== expected.tag) {
+  if (!verdict.tag) {
+    return { ok: false, why: 'verdict does not say which release it tested' };
+  }
+  if (expected.tag && verdict.tag !== expected.tag) {
     return { ok: false, why: `verdict is for ${verdict.tag}, expected ${expected.tag}` };
   }
   if (!verdict.integrity || verdict.integrity.verified !== true) {
@@ -85,11 +95,14 @@ function assess(verdict, expected) {
 // The hardware line covers NVENC / AMF / VPL. Nothing in the fleet can
 // positively exercise AMF or VPL, so it is satisfied by at least one
 // accelerator genuinely encoding, with the untestable ones reported as such.
-function assessHardware(verdicts) {
+// Takes only the verdicts assess() already accepted. Reading the raw map here
+// would let a verdict this script refused for a platform box still tick the
+// hardware box, which is the same lie by a different route.
+function assessHardware(acceptedVerdicts) {
   const exercised = [];
   const unavailable = [];
 
-  for (const verdict of verdicts.values()) {
+  for (const verdict of acceptedVerdicts) {
     for (const test of verdict.report?.tests || []) {
       const name = test.name.toLowerCase();
       if (!ACCELERATORS.includes(name)) continue;
@@ -122,7 +135,11 @@ function rewriteChecklist(body, decide) {
       const match = line.match(/^(\s*-\s*\[)( |x|X)(\]\s*)(.*)$/);
       if (!match) return line;
       const label = match[4];
-      return `${match[1]}${decide(label) ? 'x' : ' '}${match[3]}${label}`;
+      // The current state has to be handed to decide(). label is the text AFTER
+      // the checkbox, so anything testing it for "[x]" can never match, and the
+      // unrecognised-line branch would clear a box a human ticked.
+      const wasChecked = match[2].toLowerCase() === 'x';
+      return `${match[1]}${decide(label, wasChecked) ? 'x' : ' '}${match[3]}${label}`;
     })
     .join('\n');
 
@@ -207,18 +224,22 @@ function main() {
     const verdict = verdicts.get(platform);
     results.set(platform, { verdict, assessment: assess(verdict, context) });
   }
-  const hardware = assessHardware(verdicts);
+  const accepted = [...results.values()]
+    .filter((r) => r.assessment.ok && r.verdict)
+    .map((r) => r.verdict);
+  const hardware = assessHardware(accepted);
 
   const body = JSON.parse(gh(['pr', 'view', context.pr, '--repo', context.repo, '--json', 'body'])).body || '';
 
-  const updated = rewriteChecklist(body, (label) => {
+  const updated = rewriteChecklist(body, (label, wasChecked) => {
     const platformMatch = label.match(PLATFORM_LINE);
     if (platformMatch) return results.get(platformMatch[1])?.assessment.ok === true;
     if (HARDWARE_LINE.test(label)) return hardware.ok;
-    // An unrecognised checklist line is never auto-ticked. A human added it for
-    // a reason this script does not know how to verify.
+    // An unrecognised checklist line is never auto-ticked, and never cleared
+    // either. A human added it for a reason this script cannot verify, and
+    // clearing it would block the merge with no way for them to tick out of it.
     console.error(`ℹ️  leaving unrecognised checklist item untouched: ${label}`);
-    return /^\s*-?\s*\[x\]/i.test(label);
+    return wasChecked;
   });
 
   if (updated === null) {

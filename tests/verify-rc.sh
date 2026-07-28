@@ -64,6 +64,11 @@ done
 [[ -n "$Platform" ]] || { echo "Error: --platform is required." >&2; exit 2; }
 [[ -n "$WorkDir" ]] || { echo "Error: --workdir is required." >&2; exit 2; }
 [[ -n "$JsonOut" ]] || { echo "Error: --json is required." >&2; exit 2; }
+# Required, not optional. These two are the only thing tying a verdict to the
+# build it came from, and a verdict that cannot name its commit and release
+# proves nothing about which bytes were tested.
+[[ -n "$Commit" ]] || { echo "Error: --commit is required." >&2; exit 2; }
+[[ -n "$Tag" ]] || { echo "Error: --tag is required." >&2; exit 2; }
 
 # sha256 has a different tool name on every platform this fleet covers.
 sha256_of() {

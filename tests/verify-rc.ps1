@@ -11,8 +11,11 @@ param(
     [Parameter(Mandatory)][string]$Platform,
     [Parameter(Mandatory)][string]$WorkDir,
     [Parameter(Mandatory)][string]$Json,
-    [string]$Commit = '',
-    [string]$Tag = ''
+    # Mandatory, not optional. These two are the only thing tying a verdict to
+    # the build it came from, and a verdict that cannot name its commit and
+    # release proves nothing about which bytes were tested.
+    [Parameter(Mandatory)][string]$Commit,
+    [Parameter(Mandatory)][string]$Tag
 )
 
 $ErrorActionPreference = 'Stop'

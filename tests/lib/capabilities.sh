@@ -33,7 +33,14 @@ _hw_has_pci_display_vendor() {
 		return 1
 		;;
 	FreeBSD)
-		pciconf -lv 2>/dev/null | grep -qi "vendor=${want#0x}" && return 0
+		# pciconf prints `vendor=0x10de` and `class=0x030000`, so the 0x stays on
+		# and the class is filtered the same way the Linux branch filters it.
+		# Stripping the prefix made this pattern unmatchable, which reads as
+		# "no GPU" on a machine that has one - the exact silent skip this file
+		# exists to remove.
+		pciconf -lv 2>/dev/null |
+			grep -B3 -i "vendor=${want}" |
+			grep -qi 'class=0x03' && return 0
 		return 1
 		;;
 	*)

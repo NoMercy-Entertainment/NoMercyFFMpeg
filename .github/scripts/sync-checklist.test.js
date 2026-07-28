@@ -66,8 +66,10 @@ assert.strictEqual(
 );
 
 // ── Hardware line ─────────────────────────────────────────────────────────
-const withTests = (platform, tests) =>
-  new Map([[platform, { platform, report: { tests } }]]);
+// assessHardware now takes verdicts assess() has ALREADY accepted, so these
+// build the accepted shape rather than a raw map. Building them any other way
+// would have the tests assert the permissive behaviour as the specification.
+const withTests = (platform, tests) => [{ platform, report: { tests } }];
 
 let hw = assessHardware(withTests('windows-x86_64', [
   { name: 'NVENC', status: 'passed' },
@@ -104,6 +106,43 @@ assert.match(rewritten, /- \[ \] a stray box above/, 'leaves boxes above the mar
 assert.match(rewritten, /- \[ \] a stray box below/, 'leaves boxes below the markers alone');
 
 assert.strictEqual(rewriteChecklist('no markers', () => true), null, 'refuses a body with no delimiters');
+
+// A human-ticked line the script does not recognise must survive. Clearing it
+// blocks the merge in check-checklist.js and gets cleared again on every push,
+// so nobody can tick their way out of it.
+const humanBody = [
+  '<!-- TEST-CHECKLIST-START -->',
+  '- [ ] linux-x86_64 — tested on real hardware',
+  '- [x] Release notes reviewed by a human',
+  '<!-- TEST-CHECKLIST-END -->',
+].join('\n');
+const humanKept = rewriteChecklist(humanBody, (label, wasChecked) =>
+  label.startsWith('linux-x86_64') ? true : wasChecked);
+assert.match(humanKept, /- \[x\] Release notes reviewed by a human/,
+  'a human-ticked unrecognised item stays ticked');
+assert.match(humanKept, /- \[x\] linux-x86_64/, 'and the recognised one still ticks');
+
+// ── Missing proof is not the same as matching proof ───────────────────────
+const { commit: _c, ...noCommit } = passingVerdict();
+assert.strictEqual(assess(noCommit, CONTEXT).ok, false,
+  'a verdict with no commit never ticks');
+assert.strictEqual(assess({ ...passingVerdict(), commit: '' }, CONTEXT).ok, false,
+  'an empty commit is a refusal, not a skipped check');
+
+const { tag: _t, ...noTag } = passingVerdict();
+assert.strictEqual(assess(noTag, CONTEXT).ok, false,
+  'a verdict with no tag never ticks');
+assert.strictEqual(assess({ ...passingVerdict(), tag: '' }, CONTEXT).ok, false,
+  'an empty tag is a refusal, not a skipped check');
+
+// ── The hardware line inherits every refusal assess() makes ───────────────
+// A verdict assess() rejected must not tick the hardware box by another route.
+const rejected = { ...passingVerdict(), commit: 'deadbeef', platform: 'windows-x86_64' };
+rejected.report.tests = [{ name: 'NVENC', status: 'passed' }];
+assert.strictEqual(assess(rejected, CONTEXT).ok, false, 'stale commit is refused');
+assert.strictEqual(assessHardware([]).ok, false,
+  'with no accepted verdicts the hardware line cannot be satisfied');
+
 
 console.log('all sync-checklist tests passed');
 
