@@ -41,8 +41,16 @@ if [[ ${TARGET_OS} == "windows" ]]; then
     find . -name '*.cpp' -exec sed -i 's|%ld|%llu|g' {} +
     find . -name '*.cpp' -exec sed -i 's|%lld|%llu|g' {} +
 
-    # Disable the following functions that cause issues on Windows
-    sed -i '2480,2491s/^/\/\//' ggml/src/ggml-cpu/ggml-cpu.c
+    # mingw-w64's headers don't declare THREAD_POWER_THROTTLING_STATE, so ggml's
+    # thread power-throttling block in ggml_thread_apply_priority() fails to build.
+    # Disable just that block by flipping its preprocessor guard. Anchor on the
+    # guard itself instead of line numbers: the numbers move on every whisper bump,
+    # and a stale range silently comments out unrelated code.
+    if ! grep -q '#if _WIN32_WINNT >= 0x0602' ggml/src/ggml-cpu/ggml-cpu.c; then
+        echo "Error: whisper ${whisper_version} ggml-cpu.c power-throttling guard not found" >> /ffmpeg_build.log
+        exit 1
+    fi
+    sed -i 's|#if _WIN32_WINNT >= 0x0602|#if 0 // disabled: mingw-w64 lacks THREAD_POWER_THROTTLING_STATE|' ggml/src/ggml-cpu/ggml-cpu.c
 
     if [[ -f ${PREFIX}/lib/libopenblas.a ]]; then
         WHISPER_CMAKE_COMMON_ARG="${WHISPER_CMAKE_COMMON_ARG} -DGGML_BLAS=ON -DBLAS_VENDOR=OpenBLAS -DBLAS_LIBRARIES=${PREFIX}/lib/libopenblas.a -DBLAS_INCLUDE_DIRS=${PREFIX}/include/openblas"
