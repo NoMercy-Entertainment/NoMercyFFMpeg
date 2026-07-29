@@ -128,7 +128,6 @@ RUN echo "------------------------------------------------------" \
     libxext-dev \
     nasm \
     ninja-build \
-    nvidia-cuda-toolkit \
     pkg-config \
     python3 \
     python3-pip \
@@ -140,7 +139,7 @@ RUN echo "------------------------------------------------------" \
     xtrans-dev \
     xutils-dev \
     yasm >/dev/null 2>&1 \
-    && apt-get upgrade -y >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
+    && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && echo "✅ Installations completed successfully" \
     && echo "------------------------------------------------------"
