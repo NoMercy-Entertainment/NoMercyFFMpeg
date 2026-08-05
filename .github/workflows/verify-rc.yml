@@ -26,11 +26,6 @@ on:
         required: false
         default: false
         type: boolean
-      tag:
-        description: 'Verify this RC tag instead of the newest one. Report-only: requires dry_run, because the tag will not match the PR head.'
-        required: false
-        default: ''
-        type: string
 
 concurrency:
   group: verify-rc-${{ github.event.workflow_run.head_sha || inputs.pr }}
@@ -51,7 +46,6 @@ jobs:
       pr: ${{ steps.resolve.outputs.pr }}
       tag: ${{ steps.resolve.outputs.tag }}
       head-sha: ${{ steps.resolve.outputs.head-sha }}
-      test-ref: ${{ steps.resolve.outputs.test-ref }}
       assets: ${{ steps.resolve.outputs.assets }}
     steps:
       - name: Resolve PR and Release Candidate
@@ -64,8 +58,6 @@ jobs:
           RUN_EVENT: ${{ github.event.workflow_run.event }}
           RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           INPUT_PR: ${{ inputs.pr }}
-          INPUT_TAG: ${{ inputs.tag }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
 
@@ -108,20 +100,8 @@ jobs:
           # The RC is republished on every PR push. Only accept the one built
           # from exactly this head, or we would test yesterday's binaries and
           # tick today's checklist.
-          if [[ -n "${INPUT_TAG:-}" ]]; then
-            # Naming a tag by hand means testing bytes that are NOT this PR's
-            # head, so the result can never tick a box. Refusing outside dry_run
-            # keeps that from being a matter of the operator remembering.
-            if [[ "${INPUT_DRY_RUN}" != "true" ]]; then
-              echo "::error::tag=${INPUT_TAG} is report-only — re-run with dry_run enabled."
-              echo "should-run=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            TAG="$INPUT_TAG"
-          else
-            TAG=$(gh release list --repo "$REPO" --limit 30 --json tagName,isPrerelease \
-                    --jq '[.[] | select(.isPrerelease)][0].tagName // empty')
-          fi
+          TAG=$(gh release list --repo "$REPO" --limit 30 --json tagName,isPrerelease \
+                  --jq '[.[] | select(.isPrerelease)][0].tagName // empty')
           if [[ -z "$TAG" ]]; then
             echo "::error::No prerelease found to verify."
             echo "should-run=false" >> "$GITHUB_OUTPUT"
@@ -130,12 +110,9 @@ jobs:
 
           TARGET=$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.target_commitish')
           if [[ "$TARGET" != "$HEAD_SHA" ]]; then
-            if [[ -z "${INPUT_TAG:-}" ]]; then
-              echo "::warning::RC ${TAG} was built from ${TARGET} but PR #${PR} head is ${HEAD_SHA} — skipping."
-              echo "should-run=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "::warning::Report-only: ${TAG} was built from ${TARGET}, not PR #${PR} head ${HEAD_SHA}. No box can be ticked from this run."
+            echo "::warning::RC ${TAG} was built from ${TARGET} but PR #${PR} head is ${HEAD_SHA} — skipping."
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           # Emit the asset id map once so every runner can fetch by API URL,
@@ -143,20 +120,11 @@ jobs:
           ASSETS=$(gh api "repos/${REPO}/releases/tags/${TAG}" \
             --jq '[.assets[] | {name: .name, url: .url}] | tojson')
 
-          # The suite has to be the one that shipped with these binaries. On a
-          # report-only run the RC predates the PR head, and PR-head tests would
-          # fail the older build for capabilities it was never built with.
-          TEST_REF="$HEAD_SHA"
-          if [[ -n "${INPUT_TAG:-}" ]]; then
-            TEST_REF="$TARGET"
-          fi
-
           {
             echo "should-run=true"
             echo "pr=${PR}"
             echo "tag=${TAG}"
             echo "head-sha=${HEAD_SHA}"
-            echo "test-ref=${TEST_REF}"
             echo "assets=${ASSETS}"
           } >> "$GITHUB_OUTPUT"
 
@@ -200,7 +168,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.test-ref }}
+          ref: ${{ needs.resolve.outputs.head-sha }}
 
       - name: Download RC asset and manifest (unix)
         if: matrix.via != 'windows'
@@ -249,7 +217,7 @@ jobs:
             --workdir "${RUNNER_TEMP}/ffmpeg-${{ matrix.platform }}" \
             --json "verdict-${{ matrix.platform }}.json" \
             --tag "${{ needs.resolve.outputs.tag }}" \
-            --commit "${{ needs.resolve.outputs.test-ref }}"
+            --commit "${{ needs.resolve.outputs.head-sha }}"
 
       # linux-aarch64 has no dedicated machine — it runs in a native ARM Linux
       # guest on the Apple Silicon host, which is real aarch64 silicon rather
@@ -282,7 +250,7 @@ jobs:
             --workdir "${REMOTE}/w" \
             --json "${REMOTE}/verdict.json" \
             --tag "${{ needs.resolve.outputs.tag }}" \
-            --commit "${{ needs.resolve.outputs.test-ref }}"
+            --commit "${{ needs.resolve.outputs.head-sha }}"
           status=$?
           set -e
 
@@ -316,7 +284,7 @@ jobs:
             --workdir ${REMOTE}/w \
             --json ${REMOTE}/verdict.json \
             --tag ${{ needs.resolve.outputs.tag }} \
-            --commit ${{ needs.resolve.outputs.test-ref }}"
+            --commit ${{ needs.resolve.outputs.head-sha }}"
           status=$?
           set -e
 
@@ -355,7 +323,7 @@ jobs:
             -WorkDir "$env:RUNNER_TEMP\ffmpeg-${{ matrix.platform }}" `
             -Json "verdict-${{ matrix.platform }}.json" `
             -Tag '${{ needs.resolve.outputs.tag }}' `
-            -Commit '${{ needs.resolve.outputs.test-ref }}'
+            -Commit '${{ needs.resolve.outputs.head-sha }}'
 
       # always() so a failing platform still uploads its verdict — the evidence
       # comment needs to say WHICH test failed, not just that something did.
@@ -392,11 +360,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ needs.resolve.outputs.pr }}
           TAG: ${{ needs.resolve.outputs.tag }}
-          # test-ref equals head-sha on every run that can tick a box. It differs
-          # only under report-only, where comparing against the PR head would
-          # stamp "wrong commit" over each platform's real pass/fail; dry_run,
-          # which report-only requires, is what stops the write there.
-          HEAD_SHA: ${{ needs.resolve.outputs.test-ref }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head-sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: node .github/scripts/sync-checklist.js verdicts
