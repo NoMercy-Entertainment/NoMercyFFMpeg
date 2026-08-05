@@ -328,6 +328,8 @@ static int spritevtt_write_trailer(AVFormatContext *s)
     struct SwsContext *sws = NULL;
     AVIOContext *vtt_pb = NULL;
     char *vtt_path = NULL;
+    const enum AVPixelFormat *sup_fmts = NULL;
+    int nb_sup_fmts = 0;
     int ret = 0;
     int fmt_ok, i, p;
 
@@ -449,12 +451,24 @@ static int spritevtt_write_trailer(AVFormatContext *s)
     enc_ctx->height    = grid_h;
     enc_ctx->time_base = (AVRational){ 1, 1 };
 
-    /* Check if canvas pixel format is supported by the encoder */
+    /* Check if canvas pixel format is supported by the encoder.
+     * AVCodec.pix_fmts was removed in FFmpeg 9; avcodec_get_supported_config()
+     * is the replacement. A NULL list means every pixel format is accepted. */
     fmt_ok = 0;
-    if (enc->pix_fmts) {
-        const enum AVPixelFormat *p_fmt;
-        for (p_fmt = enc->pix_fmts; *p_fmt != AV_PIX_FMT_NONE; p_fmt++) {
-            if (*p_fmt == ctx->pix_fmt) {
+    ret = avcodec_get_supported_config(NULL, enc, AV_CODEC_CONFIG_PIX_FORMAT, 0,
+                                       (const void **)&sup_fmts, &nb_sup_fmts);
+    if (ret < 0) {
+        av_log(s, AV_LOG_ERROR,
+               "Could not query supported pixel formats for %s encoder\n",
+               enc->name);
+        goto cleanup;
+    }
+
+    if (!sup_fmts) {
+        fmt_ok = 1;
+    } else {
+        for (p = 0; p < nb_sup_fmts; p++) {
+            if (sup_fmts[p] == ctx->pix_fmt) {
                 fmt_ok = 1;
                 break;
             }
@@ -465,13 +479,13 @@ static int spritevtt_write_trailer(AVFormatContext *s)
         enc_ctx->pix_fmt = ctx->pix_fmt;
     } else {
         /* Use first supported format and convert with swscale */
-        if (!enc->pix_fmts || enc->pix_fmts[0] == AV_PIX_FMT_NONE) {
+        if (nb_sup_fmts <= 0 || sup_fmts[0] == AV_PIX_FMT_NONE) {
             av_log(s, AV_LOG_ERROR,
                    "Encoder has no supported pixel formats\n");
             ret = AVERROR(EINVAL);
             goto cleanup;
         }
-        enc_ctx->pix_fmt = enc->pix_fmts[0];
+        enc_ctx->pix_fmt = sup_fmts[0];
 
         av_log(s, AV_LOG_INFO,
                "Converting pixel format %s -> %s for %s encoder\n",

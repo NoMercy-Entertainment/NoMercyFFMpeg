@@ -3,7 +3,7 @@ name: CI/CD Pipeline
 # Single source of truth for the FFmpeg version produced by this build.
 # Must track `ffmpeg_version` in ffmpeg-base.dockerfile — bump both together.
 env:
-  FFMPEG_VERSION: "8.1.2"
+  FFMPEG_VERSION: "9.0"
 
 concurrency:
   group: cicd-${{ github.ref }}
@@ -440,7 +440,7 @@ jobs:
           for f in "downloads/ffmpeg-${FFMPEG_VERSION}-"*; do
             [[ -f "$f" ]] || continue
             base=$(basename "$f")
-            # ffmpeg-8.1.2-linux-x86_64.tar.gz  →  ffmpeg-8.1.2-linux-x86_64-vX.Y.Z.tar.gz
+            # ffmpeg-9.0-linux-x86_64.tar.gz  →  ffmpeg-9.0-linux-x86_64-vX.Y.Z.tar.gz
             stem="${base%.*}"
             # handle .tar.gz two-part extension
             case "$base" in

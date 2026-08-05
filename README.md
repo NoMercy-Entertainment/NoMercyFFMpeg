@@ -14,7 +14,7 @@
 
 ## 🎯 Purpose
 
-This repository contains the build infrastructure for creating optimized FFmpeg binaries (currently **FFmpeg 8.1.2**) specifically tailored for the **NoMercy MediaServer** ecosystem. These builds include custom filters, muxers, codecs, and optimizations that enhance media processing capabilities within our platform.
+This repository contains the build infrastructure for creating optimized FFmpeg binaries (currently **FFmpeg 9.0**) specifically tailored for the **NoMercy MediaServer** ecosystem. These builds include custom filters, muxers, codecs, and optimizations that enhance media processing capabilities within our platform.
 
 > **⚠️ Internal Use Only**
 > These FFmpeg builds are specifically configured for NoMercy MediaServer and may not be suitable for general-purpose use. For standard FFmpeg binaries, please visit the [official FFmpeg website](https://ffmpeg.org/).

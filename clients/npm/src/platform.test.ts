@@ -54,14 +54,14 @@ describe('assetUrl', () => {
 	it('builds the windows release URL with the pinned fork + ffmpeg versions', () => {
 		const target = resolvePlatformTarget('win32', 'x64');
 		expect(assetUrl(target)).toBe(
-			'https://github.com/NoMercy-Entertainment/nomercy-ffmpeg/releases/download/v1.0.38/ffmpeg-8.1.2-windows-x86_64-v1.0.38.zip',
+			'https://github.com/NoMercy-Entertainment/nomercy-ffmpeg/releases/download/v1.0.38/ffmpeg-9.0-windows-x86_64-v1.0.38.zip',
 		);
 	});
 
 	it('builds a tarball release URL for unix targets', () => {
 		const target = resolvePlatformTarget('linux', 'arm64');
 		expect(assetUrl(target)).toBe(
-			'https://github.com/NoMercy-Entertainment/nomercy-ffmpeg/releases/download/v1.0.38/ffmpeg-8.1.2-linux-aarch64-v1.0.38.tar.gz',
+			'https://github.com/NoMercy-Entertainment/nomercy-ffmpeg/releases/download/v1.0.38/ffmpeg-9.0-linux-aarch64-v1.0.38.tar.gz',
 		);
 	});
 });

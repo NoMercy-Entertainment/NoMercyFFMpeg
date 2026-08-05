@@ -12,15 +12,16 @@
 #   nuh_layer_id = 0 -> colour, nuh_layer_id = 1 -> alpha
 # declared through a VPS extension with scalability_mask = AUXILIARY, AuxId = 1.
 #
-# Early VideoToolbox writes a non-standard VPS extension. Stock 8.1.2 fails to
-# parse it, falls back to nb_layers = 1, logs "Ignoring unsupported VPS
-# extension" and silently drops the alpha layer -- decoding to an opaque
+# Early VideoToolbox writes a non-standard VPS extension. Stock 8.1.2 failed to
+# parse it, fell back to nb_layers = 1, logged "Ignoring unsupported VPS
+# extension" and silently dropped the alpha layer -- decoding to an opaque
 # yuv420p frame, with alphaextract failing on "Requested planes not available."
 #
 # Three patches are applied, all needed for the alpha layer to come out right:
 #
 #   1. hevc-alpha-videotoolbox.patch     upstream eedf8f0165fe (2026-04-01)
 #      Keeps the alpha layer instead of discarding the broken VPS extension.
+#      SHIPS IN 9.0 -- step 1 detects the marker and skips.
 #
 #   2. decode-get-format-first-sw.patch  upstream 3befae81f1dc (2026-03-27)
 #      avcodec_default_get_format() picks the FIRST software format instead of
@@ -28,14 +29,18 @@
 #      wins. Without this, ffprobe and every libavcodec API consumer still
 #      decode the base layer only; ffmpeg CLI was unaffected because it
 #      installs its own front-to-back get_format callback.
+#      SHIPS IN 9.0 -- step 3 detects the marker and skips.
 #
 #   3. hevc-alpha-stream-pixfmt.patch    NoMercy-only, optional
 #      Reports yuva420p at stream level. Probing never decodes a slice, so
 #      without this ffprobe -show_streams shows the base-layer yuv420p while
 #      the frames decode as yuva420p. Delete the file to drop this one.
+#      STILL REQUIRED on 9.0 -- upstream export_stream_params() is unchanged.
 #
 # Both upstream commits landed on master after release/8.1 branched and were
-# never backported, so no 8.1.x point release carries them.
+# never backported, so no 8.1.x point release carries them. FFmpeg 9.0 does.
+# The patch files are kept so this script still works against 8.1.x; each step
+# is marker-guarded, so applying them on 9.0 is a no-op rather than a conflict.
 #
 # See: https://trac.ffmpeg.org/ticket/7965
 
@@ -100,9 +105,10 @@ log "  Verified all hunks in ps.c"
 # Second upstream patch, required for the alpha layer to be decoded at all by
 # anything using libavcodec's default get_format callback. The hevc decoder
 # offers the alpha format first and the base-layer format last; stock 8.1.2's
-# avcodec_default_get_format() returns the LAST software entry, so it always
-# lands on the base layer. ffmpeg CLI installs its own front-to-back callback,
-# which is why the CLI produced alpha while ffprobe did not.
+# avcodec_default_get_format() returned the LAST software entry, so it always
+# landed on the base layer. ffmpeg CLI installs its own front-to-back callback,
+# which is why the CLI produced alpha while ffprobe did not. Fixed upstream in
+# 9.0; the guard below skips this step there.
 GETFMT_PATCH="/scripts/includes/decode-get-format-first-sw.patch"
 GETFMT_TARGET="/build/ffmpeg/libavcodec/decode.c"
 

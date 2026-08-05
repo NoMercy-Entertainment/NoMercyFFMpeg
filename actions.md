@@ -33,7 +33,7 @@ docker compose run --rm ffmpeg-linux-x86_64
 
 ```powershell
 # Smoke-test the produced binary by extracting it from the build stage
-docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -version            # expect "8.1.2"
+docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -version            # expect "9.0"
 docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -hide_banner -muxers   | Select-String "chapters_vtt|spritevtt|vobsub"
 docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -hide_banner -encoders | Select-String "ocr_subtitle"
 docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -hide_banner -filters  | Select-String "beatdetect"

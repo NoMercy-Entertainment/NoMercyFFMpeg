@@ -19,4 +19,4 @@ export const FORK_VERSION = process.env['NOMERCY_FFMPEG_VERSION'] ?? 'v1.0.38';
  * Upstream ffmpeg version baked into the pinned fork release. Part of the asset
  * filename, so overridable via `NOMERCY_FFMPEG_FFVERSION` alongside the tag.
  */
-export const FFMPEG_VERSION = process.env['NOMERCY_FFMPEG_FFVERSION'] ?? '8.1.2';
+export const FFMPEG_VERSION = process.env['NOMERCY_FFMPEG_FFVERSION'] ?? '9.0';

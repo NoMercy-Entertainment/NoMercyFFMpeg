@@ -227,6 +227,6 @@ RUN chmod +x /scripts/init/package.sh && /scripts/init/package.sh
 
 FROM alpine:latest AS final
 
-COPY --from=darwin /output/ffmpeg-8.1.2-darwin-x86_64.tar.gz /build/ffmpeg-8.1.2-darwin-x86_64.tar.gz
+COPY --from=darwin /output/ffmpeg-9.0-darwin-x86_64.tar.gz /build/ffmpeg-9.0-darwin-x86_64.tar.gz
 
-CMD ["cp", "/build/ffmpeg-8.1.2-darwin-x86_64.tar.gz", "/output"]
+CMD ["cp", "/build/ffmpeg-9.0-darwin-x86_64.tar.gz", "/output"]
