@@ -22,12 +22,43 @@
  *     major/minor by hundredths, because the two share a pitch collection,
  *     so a near tie there is close to a coin toss. When that happens the
  *     committed chord progression breaks the tie: which chords occurred,
- *     for how long, and whether any of them fall outside a candidate key's
- *     collection. Confident correlations are left alone.
+ *     in what order, for how long, and whether any of them fall outside a
+ *     candidate key's collection. Confident correlations are left alone.
+ *     Overriding also demands an absolute floor from the challenger's chord
+ *     score (rerank_floor): winning the comparison is not enough when both
+ *     scores are poor, because a progression that fits no key well is not
+ *     evidence about the key, it is evidence that the material has no
+ *     readable harmony - and that is exactly when the chroma is the better
+ *     witness. Corpus measurement puts wrong overrides at 0.34 and correct
+ *     ones at 0.78 or above, so the default floor of 0.5 sits between the
+ *     two populations rather than inside either.
+ *
+ *     Order is the part that carries the tonal centre. A key and its
+ *     relative contain the same six triads, so a duration weighted bag of
+ *     chords separates them by 0.017 at best however long the track is,
+ *     which is under half of the gap a challenger has to clear. What is not
+ *     symmetric is where the progression resolves: G->C is a cadence in
+ *     C major and an unremarkable step in A minor. Transitions between the
+ *     functional roles of successive chords are therefore scored alongside
+ *     the durations.
+ *
+ * Reliability: three orthogonal signals rather than one overloaded r.
+ *     tonalness      is there pitched material here at all
+ *     chord_coherence does that material form a key
+ *     key_margin     is the tonal centre within that key decided
+ *   r answers none of these on its own. It rises on any track once
+ *   unpitched content stops diluting the chroma, so a percussive track
+ *   whose key is undecidable can report a perfectly healthy r.
  *
  * Output (per frame metadata, and log events on change):
  *   lavfi.keydetect.key            e.g. "C", "F#m"
- *   lavfi.keydetect.key_confidence Pearson r of the best key
+ *   lavfi.keydetect.key_confidence Pearson r of the reported key. Note that
+ *                                  when key_reranked is 1 this is the
+ *                                  challenger's correlation, which is by
+ *                                  construction below the leader's; use
+ *                                  key_r_leader to compare across tracks.
+ *   lavfi.keydetect.key_r_leader   Pearson r of the correlation leader,
+ *                                  whether or not the chords overrode it
  *   lavfi.keydetect.key_alt        runner-up key
  *   lavfi.keydetect.key_alt_confidence  Pearson r of the runner-up
  *   lavfi.keydetect.key_margin     r of the best minus r of the runner-up.
@@ -37,8 +68,33 @@
  *   lavfi.keydetect.key_candidates "Cm:0.885,D#:0.879,Gm:0.812"
  *   lavfi.keydetect.key_reranked   1 if the chord progression overrode the
  *                                  chroma correlation
+ *   lavfi.keydetect.tonalness      mean tonalness of the analysed windows,
+ *                                  0 = unpitched throughout, 1 = clean
+ *                                  triads throughout. Low means the key
+ *                                  question is ill posed for this material,
+ *                                  which r used to signal only by accident.
+ *   lavfi.keydetect.chord_coherence best chord progression score over all
+ *                                  24 keys. At or below zero there is no
+ *                                  usable harmony here: either too little
+ *                                  committed chord time to judge, or a
+ *                                  progression that fits no key at all,
+ *                                  which is what a pitched riff or an 808
+ *                                  line looks like when it is tracked
+ *                                  faithfully because it is the only
+ *                                  harmonic content there is.
  *   lavfi.keydetect.chord          current stable chord, "N" = no chord
  *   lavfi.keydetect.chords         chord progression so far, e.g. "C-Am-F-G"
+ *   lavfi.keydetect.bass_tonic     strongest pitch class in the bass band
+ *   lavfi.keydetect.bass_chroma    the whole bass band profile, 12 values
+ *                                  scaled to a maximum of 1, C first
+ *
+ * Emitted once at end of input, in addition to all of the above:
+ *   lavfi.keydetect.key_profiles   the winner under each of the four key
+ *                                  profiles off the same accumulated
+ *                                  chroma, "shaath:Cm:0.896,edma:Cm:0.881,
+ *                                  temperley:D#:0.874,krumhansl:Cm:0.869".
+ *                                  Costs one correlation pass, and profile
+ *                                  disagreement is itself a warning.
  *
  * This file is intended for integration into FFmpeg's libavfilter.
  * Compile within an FFmpeg source tree (verified against FFmpeg 8.1.2).
@@ -69,6 +125,19 @@
 #define FREQ_MIN            55.0  /* A1: lowest peak frequency used */
 #define FREQ_MAX            2000.0/* above this it is almost all harmonics */
 #define FUND_MIN            25.0  /* lowest folded fundamental accepted */
+/* Bass register, E1..E3. Deliberately reaches five semitones below FREQ_MIN:
+ * the main peak picker starts at A1 and never sees the bottom of a bass
+ * guitar or a synth bass, which is exactly where the root of the chord tends
+ * to be stated. The band is analysed separately rather than by lowering
+ * FREQ_MIN, because widening the main picker would also let kick drum and
+ * sub rumble into the key chroma. The extraction rule matters more than the
+ * band: a rule that thresholds against the frame maximum over C1..C4 scores
+ * below chance on real music, because it locks onto rumble rather than
+ * played notes, while band folding over E1..E3 reaches four times chance.
+ * Reported as metadata only; it does not touch the key decision. */
+#define BASS_FREQ_MIN       41.0  /* E1 */
+#define BASS_FREQ_MAX       165.0 /* E3 */
+#define BASS_PEAK_REL       0.05f /* peaks >= 5% of the band maximum */
 #define SMOOTH_MAX_HOPS     64
 #define PROG_STR_SIZE       512
 
@@ -136,8 +205,70 @@ static const float func_weight[2][2][12] = {
     },
 };
 
+/* The six diatonic triads of a major key are the same six triads as those of
+ * its relative minor, so the two rows above have to sum to the same total
+ * over that shared set or every relative pair is decided by a property of
+ * the table rather than by the music. As written they do not: the major
+ * degrees (I ii iii IV V vi) sum to 4.00 and the minor ones (i III iv v VI
+ * VII) to 4.10, which is a flat +0.0167 handed to the relative minor of
+ * every key on identical evidence. That is the same direction as the errors
+ * the scorer makes on major key material. Rescaling the two rows onto a
+ * common total removes the bias without changing the relative weighting of
+ * the degrees within either mode. */
+static const float func_diatonic_sum[2] = { 4.00f, 4.10f };
+
+/* Functional role of a triad within a candidate key, keyed exactly as
+ * func_weight: [key mode][chord quality][interval from key root]. FC_OUT
+ * marks the intervals func_weight also rules out, so the two tables always
+ * agree about what is in the key. */
+enum ChordFunction {
+    FC_TONIC,
+    FC_SUBDOM,
+    FC_DOM,
+    FC_OTHER,
+    FC_OUT,
+    NB_FUNCTIONS
+};
+
+static const uint8_t chord_function[2][2][12] = {
+    [0] = { /* major key */
+        /* major chord */ { FC_TONIC, FC_OUT,  FC_OUT,    FC_OTHER, FC_OUT,   FC_SUBDOM,
+                            FC_OUT,   FC_DOM,  FC_OTHER,  FC_OUT,   FC_OTHER, FC_OUT },
+        /* minor chord */ { FC_OUT,   FC_OUT,  FC_SUBDOM, FC_OUT,   FC_OTHER, FC_SUBDOM,
+                            FC_OUT,   FC_OUT,  FC_OUT,    FC_OTHER, FC_OUT,   FC_OUT },
+    },
+    [1] = { /* minor key */
+        /* major chord */ { FC_OTHER, FC_OUT,  FC_OUT,    FC_OTHER, FC_OUT,   FC_SUBDOM,
+                            FC_OUT,   FC_DOM,  FC_OTHER,  FC_OUT,   FC_DOM,   FC_OUT },
+        /* minor chord */ { FC_TONIC, FC_OUT,  FC_SUBDOM, FC_OUT,   FC_OUT,   FC_SUBDOM,
+                            FC_OUT,   FC_DOM,  FC_OUT,    FC_OUT,   FC_OTHER, FC_OUT },
+    },
+};
+
+/* Evidence that a key is the key, contributed by one committed chord change,
+ * indexed [role departed][role arrived]. Arrival on the tonic is what the
+ * duration histogram cannot see: a dominant resolving to it is a cadence and
+ * names the key outright, a subdominant resolving to it is the weaker plagal
+ * version, and a deceptive V to submediant is nearly as telling as the real
+ * thing. Motion involving a chord outside the key counts against it, which
+ * is what keeps a chromatic riff from scoring anywhere. */
+static const float trans_weight[NB_FUNCTIONS][NB_FUNCTIONS] = {
+    /*   to:      TONIC   SUBDOM     DOM   OTHER     OUT */
+    [FC_TONIC]  = { 0.10f,  0.10f,  0.10f,  0.05f, -0.10f },
+    [FC_SUBDOM] = { 0.35f,  0.05f,  0.25f,  0.05f, -0.10f },
+    [FC_DOM]    = { 0.60f,  0.00f,  0.05f,  0.15f, -0.10f },
+    [FC_OTHER]  = { 0.15f,  0.10f,  0.10f,  0.05f, -0.10f },
+    [FC_OUT]    = {-0.10f, -0.10f, -0.10f, -0.10f, -0.20f },
+};
+
 /* Loop based pop tends to start and end its cycle on the tonic. Weak cues
- * on their own, which is why they only ever break a correlation tie. */
+ * on their own, which is why they only ever break a correlation tie. They
+ * are also the only part of the chord score that a fade-out corrupts: the
+ * last committed chord of a faded track is an accident of where the fade
+ * crossed the silence gate, not a cadence, yet at 0.20 the bonus outweighs
+ * the whole rerank gap. Corpus measurement attributed one wrong override to
+ * exactly that. tonic_bonus scales both cues so their worth can be measured
+ * per corpus rather than argued from here; 1.0 reproduces r3. */
 #define TONIC_FIRST_BONUS 0.15f
 #define TONIC_LAST_BONUS  0.20f
 /* Below this much committed chord evidence the progression is too thin to
@@ -149,6 +280,11 @@ static const float func_weight[2][2][12] = {
  * with some key. */
 #define MIN_DISTINCT_CHORDS 3
 #define MIN_STABLE_MS       5000
+/* Distinct chord changes tracked. Pop songs use a couple of dozen; the cap
+ * only bounds the pathological case, and once it is reached further changes
+ * are counted in trans_count but not scored, which weakens the cadence term
+ * rather than corrupting it. */
+#define TRANS_MAX           256
 
 /* Binary triad templates: 12 major then 12 minor, root order C..B.
  * Major: root, +4, +7. Minor: root, +3, +7. */
@@ -197,6 +333,12 @@ typedef struct KeyDetectContext {
     int rerank;
     double rerank_margin;
     double rerank_gap;
+    double rerank_slope;
+    double rerank_floor;
+    int mode_balance;
+    float transition;
+    float tonic_bonus;
+    int bass;
 
     /* Configuration derived */
     int sample_rate;
@@ -206,8 +348,6 @@ typedef struct KeyDetectContext {
     int smooth_hops;
     int min_dur_hops;
     double silence_rms2;
-    /* Key profile statistics for Pearson correlation */
-    double prof_mean[2], prof_sd[2];
 
     /* FFT */
     AVTXContext *tx_ctx;
@@ -233,6 +373,11 @@ typedef struct KeyDetectContext {
     double key_r[NUM_KEYS];   /* correlation of every candidate     */
     int key_rank[NUM_CANDIDATES]; /* best candidates, -1 unset      */
     double key_margin;        /* r of the best minus the runner up  */
+    int key_lead;             /* correlation leader, before rerank  */
+
+    /* Bass register, accumulated separately from the key chroma and
+     * reported as metadata only. See BASS_FREQ_MIN. */
+    double bass_chroma[12];
 
     /* Chords */
     float *score_lp;          /* [smooth_hops][24] score history   */
@@ -248,11 +393,28 @@ typedef struct KeyDetectContext {
     /* Chord evidence for the key decision. Accumulated over the whole
      * input, unlike progression[] which only keeps the newest entries. */
     double chord_dur[NUM_CHORD_TEMPLATES]; /* hops each chord was held */
+    /* Chord changes. Which chord follows which is the only part of the
+     * progression that is not symmetric between a key and its relative, so
+     * it is kept alongside the durations. Held as a list of the pairs that
+     * actually occurred rather than as a 24x24 matrix: a song uses a couple
+     * of dozen distinct changes out of 576 possible ones, and this is
+     * rescored for every candidate key on every hop. */
+    uint8_t trans_from[TRANS_MAX], trans_to[TRANS_MAX];
+    double trans_n[TRANS_MAX];
+    int trans_pairs;
+    int64_t trans_count;      /* chord changes committed           */
     int chord_first;          /* first stable chord, -1 unset      */
     int chord_last;           /* most recent stable chord          */
     int64_t stable_hops;      /* hops spent on a stable chord      */
     int64_t total_hops;       /* hops analysed                     */
     int reranked;             /* key decided by chord evidence     */
+
+    /* Reliability signals. The per window tonalness weight already drives
+     * the salience weighting; accumulating it costs nothing and is the only
+     * thing that says whether the material has a key to find at all. */
+    double salience_sum;
+    int64_t salience_hops;
+    double chord_coherence;   /* best chord score over all 24 keys */
 } KeyDetectContext;
 
 #define OFFSET(x) offsetof(KeyDetectContext, x)
@@ -275,8 +437,14 @@ static const AVOption keydetect_options[] = {
     { "compression", "chroma log compression factor", OFFSET(compression), AV_OPT_TYPE_FLOAT, { .dbl = 100.0 }, 1, 10000, FLAGS },
     { "salience", "weight the key chroma by how tonal each window is", OFFSET(salience), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, 0, 1, FLAGS },
     { "rerank", "break near ties in the key correlation using the chord progression", OFFSET(rerank), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
-    { "rerank_margin", "consider keys within this correlation distance of the leader", OFFSET(rerank_margin), AV_OPT_TYPE_DOUBLE, { .dbl = 0.06 }, 0, 1, FLAGS },
-    { "rerank_gap", "chord score the challenger must win by", OFFSET(rerank_gap), AV_OPT_TYPE_DOUBLE, { .dbl = 0.05 }, 0, 2, FLAGS },
+    { "rerank_margin", "consider keys within this correlation distance of the leader", OFFSET(rerank_margin), AV_OPT_TYPE_DOUBLE, { .dbl = 0.12 }, 0, 1, FLAGS },
+    { "rerank_gap", "chord score the challenger must win by at zero correlation deficit", OFFSET(rerank_gap), AV_OPT_TYPE_DOUBLE, { .dbl = 0.05 }, 0, 2, FLAGS },
+    { "rerank_slope", "extra chord score demanded per unit of correlation deficit; 0 restores a hard window", OFFSET(rerank_slope), AV_OPT_TYPE_DOUBLE, { .dbl = 0.5 }, 0, 20, FLAGS },
+    { "rerank_floor", "absolute chord score a challenger must reach to override the chroma; 0 restores r3", OFFSET(rerank_floor), AV_OPT_TYPE_DOUBLE, { .dbl = 0.5 }, 0, 2, FLAGS },
+    { "mode_balance", "equalise the harmonic function weights between a key and its relative", OFFSET(mode_balance), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
+    { "transition", "weight of cadence transitions in the chord score", OFFSET(transition), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, 0, 4, FLAGS },
+    { "tonic_bonus", "weight of the first/last tonic-chord bonuses in the chord score", OFFSET(tonic_bonus), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, 0, 4, FLAGS },
+    { "bass", "accumulate a bass register chroma and report it as metadata", OFFSET(bass), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
     { NULL }
 };
 
@@ -371,24 +539,13 @@ static int config_input(AVFilterLink *inlink)
     for (int i = 0; i < s->win_len; i++)
         s->win_func[i] = 0.5f - 0.5f * cosf(2.0 * M_PI * i / (s->win_len - 1));
 
-    /* Rotation-invariant profile statistics for Pearson correlation */
-    for (int mode = 0; mode < 2; mode++) {
-        const double *p = key_profiles[s->profile][mode];
-        double sum = 0.0, sq = 0.0;
-        for (int i = 0; i < 12; i++) {
-            sum += p[i];
-            sq  += p[i] * p[i];
-        }
-        s->prof_mean[mode] = sum / 12.0;
-        s->prof_sd[mode]   = sqrt(fmax(sq / 12.0 - s->prof_mean[mode] * s->prof_mean[mode], 1e-12));
-    }
-
     s->total_in       = 0;
     s->next_win_end   = s->win_len;
     s->tune_offset    = 0.0;
     s->key_index      = -1;
     s->key_confidence = 0.0;
     s->key_margin     = 0.0;
+    s->key_lead       = -1;
     for (int i = 0; i < NUM_CANDIDATES; i++)
         s->key_rank[i] = -1;
     memset(s->key_r, 0, sizeof(s->key_r));
@@ -404,7 +561,14 @@ static int config_input(AVFilterLink *inlink)
     s->stable_hops    = 0;
     s->total_hops     = 0;
     s->reranked       = 0;
+    s->trans_count    = 0;
+    s->trans_pairs    = 0;
+    s->salience_sum   = 0.0;
+    s->salience_hops  = 0;
+    s->chord_coherence = 0.0;
     memset(s->chord_dur, 0, sizeof(s->chord_dur));
+    memset(s->trans_n, 0, sizeof(s->trans_n));
+    memset(s->bass_chroma, 0, sizeof(s->bass_chroma));
     memset(s->tune_hist, 0, sizeof(s->tune_hist));
     memset(s->key_chroma, 0, sizeof(s->key_chroma));
 
@@ -439,7 +603,7 @@ static int process_window(KeyDetectContext *s)
     float max_mag = 0.0f, vmax = 0.0f, chroma_norm2 = 0.0f, raw_best = 0.0f;
     double rms2 = 0.0;
     int64_t start = s->next_win_end - s->win_len;
-    int k_lo, k_hi, silent;
+    int k_lo, k_hi, mag_lo, bass_lo, bass_hi, silent;
 
     for (int i = 0; i < s->win_len; i++) {
         float v = s->ring[(start + i) % s->win_len];
@@ -457,8 +621,15 @@ static int process_window(KeyDetectContext *s)
         k_lo = FFMAX(2, (int)(FREQ_MIN * s->fft_len / s->sample_rate));
         k_hi = FFMIN(s->fft_len / 2 - 1,
                      (int)(FREQ_MAX * s->fft_len / s->sample_rate));
+        bass_lo = FFMAX(2, (int)(BASS_FREQ_MIN * s->fft_len / s->sample_rate));
+        bass_hi = FFMIN(s->fft_len / 2 - 1,
+                        (int)(BASS_FREQ_MAX * s->fft_len / s->sample_rate));
+        /* The bass band starts below FREQ_MIN, so magnitudes are needed
+         * further down than the main picker asks for. max_mag stays scoped
+         * to the main band, leaving the key path untouched. */
+        mag_lo = s->bass ? FFMIN(k_lo, bass_lo) : k_lo;
 
-        for (int k = k_lo - 1; k <= k_hi + 1; k++) {
+        for (int k = mag_lo - 1; k <= k_hi + 1; k++) {
             float re = s->fft_out[k].re, im = s->fft_out[k].im;
             s->mag[k] = sqrtf(re * re + im * im);
             if (k >= k_lo && k <= k_hi && s->mag[k] > max_mag)
@@ -505,6 +676,54 @@ static int process_window(KeyDetectContext *s)
                 pc = ((n % 12) + 12) % 12;
                 w  = cosf(M_PI * d);            /* cos^2 sub-semitone window */
                 chroma[pc] += m * (w * w) * powf(HARMONIC_DECAY, h - 1);
+            }
+        }
+
+        /* Bass register profile, band folded. Every interpolated peak in
+         * E1..E3 contributes its magnitude to its own pitch class, with no
+         * harmonic folding: the point of the band is the note that was
+         * played down there, and folding would drag the upper partials of
+         * everything else back into it. The threshold is relative to the
+         * loudest peak *in the band*, not to the frame, because a frame
+         * relative floor lets a loud mix silence the bass entirely on some
+         * frames and admit rumble on others.
+         *
+         * Caveat worth knowing before trusting the bottom octave: at the
+         * default 190 ms window the FFT bin spacing is around 2.7 Hz while
+         * a semitone at E1 spans 2.4 Hz, so adjacent semitones down there
+         * are not separable as distinct peaks. Parabolic interpolation
+         * still places a single isolated peak accurately, which is the
+         * common case for a bass line, but a constant-Q front end would
+         * resolve this band properly and this one does not. */
+        if (s->bass) {
+            float band_max = 0.0f;
+            for (int k = bass_lo; k <= bass_hi; k++)
+                if (s->mag[k] > band_max)
+                    band_max = s->mag[k];
+            if (band_max > 0.0f) {
+                for (int k = bass_lo; k <= bass_hi; k++) {
+                    float m = s->mag[k];
+                    double a, b, c, delta, freq, fm;
+                    int n, pc;
+
+                    if (m < band_max * BASS_PEAK_REL ||
+                        m <= s->mag[k - 1] || m < s->mag[k + 1])
+                        continue;
+
+                    a = log(s->mag[k - 1] + 1e-20);
+                    b = log(m + 1e-20);
+                    c = log(s->mag[k + 1] + 1e-20);
+                    delta = 0.5 * (a - c) / (a - 2.0 * b + c + 1e-20);
+                    delta = av_clipd(delta, -0.5, 0.5);
+                    freq = (k + delta) * (double)s->sample_rate / s->fft_len;
+                    if (freq < BASS_FREQ_MIN || freq > BASS_FREQ_MAX)
+                        continue;
+
+                    fm = 69.0 + 12.0 * log2(freq / s->tuning_hz) - s->tune_offset;
+                    n  = (int)floor(fm + 0.5);
+                    pc = ((n % 12) + 12) % 12;
+                    s->bass_chroma[pc] += m / band_max;
+                }
             }
         }
 
@@ -558,6 +777,18 @@ static int process_window(KeyDetectContext *s)
         float weight = (1.0f - s->salience) + s->salience * w;
         for (int i = 0; i < 12; i++)
             s->key_chroma[i] += chroma[i] * weight;
+
+        /* w is the only measurement of whether this window contains pitched
+         * material, and until now it was used as a multiplier and thrown
+         * away. It is worth reporting in its own right. Weighting the
+         * chroma by it removes the unpitched pedestal, which raises the key
+         * correlation on every track and raises it most on the tracks that
+         * had the most unpitched content to remove, so r rises fastest
+         * exactly where it is least trustworthy. Keeping the mean of w
+         * hands that judgement back to the caller as a separate number
+         * instead of leaving it smuggled inside r. */
+        s->salience_sum += w;
+        s->salience_hops++;
     }
 
     /* Low-pass filter the scores over the last smooth_hops windows */
@@ -588,10 +819,10 @@ static int process_window(KeyDetectContext *s)
  * chroma against all 24 rotations of the selected profile pair. Keeps the
  * full correlation vector and the best NUM_CANDIDATES candidates, so that
  * callers can see how close the runner up was. */
-static void compute_key(KeyDetectContext *s)
+static int correlate_profile(KeyDetectContext *s, int profile,
+                             double out_r[NUM_KEYS])
 {
     double cm = 0.0, csd = 0.0;
-    int rank[NUM_CANDIDATES];
 
     for (int i = 0; i < 12; i++)
         cm += s->key_chroma[i];
@@ -600,19 +831,35 @@ static void compute_key(KeyDetectContext *s)
         csd += (s->key_chroma[i] - cm) * (s->key_chroma[i] - cm);
     csd = sqrt(csd / 12.0);
     if (csd < 1e-9)
-        return;
+        return 0;
 
     for (int mode = 0; mode < 2; mode++) {
-        const double *p = key_profiles[s->profile][mode];
+        const double *p = key_profiles[profile][mode];
+        double pm = 0.0, psq = 0.0, psd;
+
+        for (int i = 0; i < 12; i++) {
+            pm  += p[i];
+            psq += p[i] * p[i];
+        }
+        pm /= 12.0;
+        psd = sqrt(fmax(psq / 12.0 - pm * pm, 1e-12));
+
         for (int root = 0; root < 12; root++) {
             double dot = 0.0;
             for (int i = 0; i < 12; i++)
                 dot += s->key_chroma[i] * p[(i - root + 12) % 12];
-            s->key_r[root + 12 * mode] =
-                (dot / 12.0 - cm * s->prof_mean[mode]) /
-                (csd * s->prof_sd[mode]);
+            out_r[root + 12 * mode] = (dot / 12.0 - cm * pm) / (csd * psd);
         }
     }
+    return 1;
+}
+
+static void compute_key(KeyDetectContext *s)
+{
+    int rank[NUM_CANDIDATES];
+
+    if (!correlate_profile(s, s->profile, s->key_r))
+        return;
 
     for (int i = 0; i < NUM_CANDIDATES; i++)
         rank[i] = -1;
@@ -629,20 +876,59 @@ static void compute_key(KeyDetectContext *s)
 
     memcpy(s->key_rank, rank, sizeof(rank));
     s->key_index      = rank[0];
+    s->key_lead       = rank[0];
     s->key_confidence = s->key_r[rank[0]];
     s->key_margin     = rank[1] >= 0 ? s->key_r[rank[0]] - s->key_r[rank[1]]
                                      : 0.0;
 }
 
+/* Cadence score of the committed chord changes against one candidate key.
+ *
+ * This is the half of the progression the duration histogram structurally
+ * cannot express. A key and its relative minor contain the same six triads,
+ * so however the durations fall the bag of chords separates the two by at
+ * most a couple of hundredths, and the separation that does exist comes
+ * from the shape of the weight table rather than from the music. Where the
+ * progression *goes* is not symmetric: in C major the loop C-Am-F-G-C
+ * resolves a dominant onto the tonic, and read as A minor the very same
+ * loop never resolves onto anything, it merely passes through its tonic on
+ * the way somewhere else. Scoring transitions between functional roles
+ * recovers that asymmetry, and it is worth several times the dynamic range
+ * of the durations on exactly the decision that needs it. */
+static double chord_trans_score(KeyDetectContext *s, int key)
+{
+    const int kr = key % 12, km = key / 12;
+    double score = 0.0;
+
+    if (s->trans_count <= 0)
+        return 0.0;
+
+    for (int i = 0; i < s->trans_pairs; i++) {
+        const int from = s->trans_from[i], to = s->trans_to[i];
+        const int fi = ((from % 12) - kr + 12) % 12;
+        const int ti = ((to   % 12) - kr + 12) % 12;
+
+        score += (s->trans_n[i] / s->trans_count) *
+                 trans_weight[chord_function[km][from / 12][fi]]
+                             [chord_function[km][to   / 12][ti]];
+    }
+    return score;
+}
+
 /* Duration weighted harmonic-function score of the committed chord
- * progression against one candidate key. The averaged chroma cannot see
- * which chords occurred or how long they lasted, but the segment tracker
- * already measured exactly that; this turns it into key evidence.
- * Range is roughly [-0.6, 1.35]. */
+ * progression against one candidate key, plus the cadence term above. The
+ * averaged chroma cannot see which chords occurred, in what order or how
+ * long they lasted, but the segment tracker already measured exactly that;
+ * this turns it into key evidence. Range is roughly [-0.8, 1.7]. */
 static double chord_key_score(KeyDetectContext *s, int key)
 {
     const int kr = key % 12, km = key / 12;
     const int tonic = km ? kr + 12 : kr;
+    /* Put the two modes on a common total over the shared diatonic set, so
+     * that a relative pair starts level and is separated by the evidence
+     * rather than by the table. See func_diatonic_sum. */
+    const double norm = s->mode_balance
+                      ? func_diatonic_sum[0] / func_diatonic_sum[km] : 1.0;
     double score = 0.0;
 
     if (s->stable_hops <= 0)
@@ -654,12 +940,14 @@ static double chord_key_score(KeyDetectContext *s, int key)
             continue;
         iv = ((c % 12) - kr + 12) % 12;
         score += (s->chord_dur[c] / s->stable_hops) *
-                 func_weight[km][c / 12][iv];
+                 func_weight[km][c / 12][iv] * norm;
     }
     if (s->chord_first == tonic)
-        score += TONIC_FIRST_BONUS;
+        score += s->tonic_bonus * TONIC_FIRST_BONUS;
     if (s->chord_last == tonic)
-        score += TONIC_LAST_BONUS;
+        score += s->tonic_bonus * TONIC_LAST_BONUS;
+    if (s->transition > 0.0f)
+        score += s->transition * chord_trans_score(s, key);
 
     return score;
 }
@@ -682,41 +970,74 @@ static int chord_evidence_usable(KeyDetectContext *s)
 /* Break a near tie in the chroma correlation using the chord progression.
  * Relative major/minor pairs share a pitch collection, so the correlation
  * separates them by hundredths and the winner is close to arbitrary; the
- * chord sequence is what actually carries the tonal centre. Only candidates
- * within rerank_margin of the leader are considered, and the challenger has
- * to beat the leader's chord score by a clear gap, so confident correlation
- * results are never disturbed. */
+ * chord sequence is what actually carries the tonal centre. A challenger has
+ * to beat the leader's chord score by a gap that grows with how far behind
+ * it started, so a photo finish can be settled by the chords while a
+ * confident correlation result is left alone. rerank_margin remains as an
+ * outer bound on which candidates are worth scoring at all. */
 static void rerank_key(KeyDetectContext *s)
 {
-    double lead_score, best_score;
+    double score[NUM_KEYS], lead_score, best_score, best_excess = -1.0;
     int lead, best;
 
     s->reranked = 0;
-    if (!s->rerank || s->key_rank[0] < 0 || !chord_evidence_usable(s))
+    s->chord_coherence = 0.0;
+    if (s->key_rank[0] < 0 || !chord_evidence_usable(s))
+        return;
+
+    /* Score every key once. Both the coherence figure and the tie-break
+     * below need the same 24 numbers, and this runs on every hop. */
+    for (int k = 0; k < NUM_KEYS; k++) {
+        score[k] = chord_key_score(s, k);
+        if (k == 0 || score[k] > s->chord_coherence)
+            s->chord_coherence = score[k];
+    }
+
+    if (!s->rerank)
         return;
 
     lead       = s->key_rank[0];
-    lead_score = chord_key_score(s, lead);
+    lead_score = score[lead];
     best       = lead;
     best_score = lead_score;
 
     for (int k = 0; k < NUM_KEYS; k++) {
-        double sc;
+        double deficit, needed, excess;
+
         if (k == lead || s->key_r[k] < s->key_r[lead] - s->rerank_margin)
             continue;
-        sc = chord_key_score(s, k);
-        if (sc > best_score) {
-            best_score = sc;
-            best = k;
+
+        /* A hard window with a flat gap is a cliff: a candidate a hair
+         * inside it needs the same evidence as one at the very edge, and a
+         * candidate a hair outside is refused any amount of evidence at
+         * all. Demand instead that a challenger out-argue the correlation
+         * by more the further behind it started, and among those that
+         * manage it prefer the one that clears its own bar by the most.
+         * rerank_slope=0 restores the flat behaviour exactly. */
+        deficit = s->key_r[lead] - s->key_r[k];
+        needed  = s->rerank_gap + s->rerank_slope * FFMAX(deficit, 0.0);
+        excess  = score[k] - lead_score - needed;
+
+        if (excess >= 0.0 && excess > best_excess) {
+            best_excess = excess;
+            best_score  = score[k];
+            best        = k;
         }
     }
 
     /* best_score <= 0 means no candidate key explains the progression, i.e.
      * the committed chords are chromatic rather than harmonic (a pitched
      * riff or 808 line tracked faithfully because it is all the harmonic
-     * content there is). Say nothing rather than override the chroma. */
-    if (best == lead || best_score <= 0.0 ||
-        best_score - lead_score < s->rerank_gap)
+     * content there is). Say nothing rather than override the chroma.
+     *
+     * rerank_floor extends the same principle above zero: out-arguing the
+     * leader is a relative judgement, and when both chord scores are poor,
+     * winning it says only that one bad reading is less bad than another.
+     * The override is refused unless the challenger's evidence is also good
+     * in absolute terms. The floor gates the override, never the leader:
+     * failing it leaves the correlation answer standing, it does not
+     * withhold a key. */
+    if (best == lead || best_score <= 0.0 || best_score < s->rerank_floor)
         return;
 
     /* Keep the displaced correlation winner as the reported alternative.
@@ -748,6 +1069,75 @@ static void candidates_string(KeyDetectContext *s, char *out, size_t out_size)
     }
 }
 
+/* Strongest pitch class in the bass band, -1 if the band stayed empty. */
+static int bass_tonic(KeyDetectContext *s)
+{
+    int best = -1;
+
+    for (int i = 0; i < 12; i++)
+        if (s->bass_chroma[i] > 0.0 &&
+            (best < 0 || s->bass_chroma[i] > s->bass_chroma[best]))
+            best = i;
+    return best;
+}
+
+/* The bass band profile scaled to a maximum of 1, C first. Reported whole
+ * rather than as a single winner because one band, one rule and one corpus
+ * is not enough to know which reduction of it is the useful one. */
+static void bass_string(KeyDetectContext *s, char *out, size_t out_size)
+{
+    double vmax = 0.0;
+    size_t used = 0;
+
+    out[0] = '\0';
+    for (int i = 0; i < 12; i++)
+        if (s->bass_chroma[i] > vmax)
+            vmax = s->bass_chroma[i];
+    if (vmax <= 0.0)
+        return;
+
+    for (int i = 0; i < 12; i++) {
+        int len = snprintf(out + used, out_size - used, "%s%.3f",
+                           used ? "," : "", s->bass_chroma[i] / vmax);
+        if (len < 0 || (size_t)len >= out_size - used)
+            break;
+        used += len;
+    }
+}
+
+/* Every profile's winner off the same accumulated chroma. The chroma is
+ * already paid for, so the other three profiles cost one correlation pass
+ * each at end of input and nothing per frame. Disagreement between them is
+ * a reliability signal in its own right: four profiles built from different
+ * corpora landing on the same key is a much stronger statement than any one
+ * of them scoring well. */
+static void profiles_string(KeyDetectContext *s, char *out, size_t out_size)
+{
+    static const char *const profile_names[NB_PROFILES] = {
+        "krumhansl", "temperley", "shaath", "edma"
+    };
+    size_t used = 0;
+
+    out[0] = '\0';
+    for (int p = 0; p < NB_PROFILES; p++) {
+        double r[NUM_KEYS];
+        char one[8];
+        int best = 0, len;
+
+        if (!correlate_profile(s, p, r))
+            return;
+        for (int k = 1; k < NUM_KEYS; k++)
+            if (r[k] > r[best])
+                best = k;
+        key_name(best, one, sizeof(one));
+        len = snprintf(out + used, out_size - used, "%s%s:%s:%.3f",
+                       used ? "," : "", profile_names[p], one, r[best]);
+        if (len < 0 || (size_t)len >= out_size - used)
+            break;
+        used += len;
+    }
+}
+
 /* Segment tracking: a label must persist for min_dur_hops before it becomes
  * the stable chord and is committed to the progression. */
 static void update_segments(AVFilterContext *ctx, int label, double t)
@@ -765,6 +1155,25 @@ static void update_segments(AVFilterContext *ctx, int label, double t)
         s->stable_label = s->seg_label;
         if (s->seg_label >= 0 && s->seg_label != s->last_committed) {
             char name[8];
+            /* Record the chord change itself. Repeats are already collapsed
+             * by the last_committed test above, which is what we want: a
+             * chord held over four bars is one harmonic event, not four. */
+            if (s->last_committed >= 0) {
+                int i;
+                for (i = 0; i < s->trans_pairs; i++)
+                    if (s->trans_from[i] == s->last_committed &&
+                        s->trans_to[i]   == s->seg_label)
+                        break;
+                if (i < s->trans_pairs) {
+                    s->trans_n[i] += 1.0;
+                } else if (s->trans_pairs < TRANS_MAX) {
+                    s->trans_from[i] = s->last_committed;
+                    s->trans_to[i]   = s->seg_label;
+                    s->trans_n[i]    = 1.0;
+                    s->trans_pairs++;
+                }
+                s->trans_count++;
+            }
             if (s->progression_len == PROGRESSION_MAX) {
                 memmove(s->progression, s->progression + 1,
                         (PROGRESSION_MAX - 1) * sizeof(*s->progression));
@@ -806,10 +1215,28 @@ static void set_frame_metadata(KeyDetectContext *s, AVFrame *frame)
             av_dict_set(&frame->metadata,
                         "lavfi.keydetect.key_alt_confidence", buf, 0);
         }
+        snprintf(buf, sizeof(buf), "%.3f", s->key_r[s->key_lead]);
+        av_dict_set(&frame->metadata, "lavfi.keydetect.key_r_leader", buf, 0);
         candidates_string(s, buf, sizeof(buf));
         av_dict_set(&frame->metadata, "lavfi.keydetect.key_candidates", buf, 0);
         av_dict_set(&frame->metadata, "lavfi.keydetect.key_reranked",
                     s->reranked ? "1" : "0", 0);
+        snprintf(buf, sizeof(buf), "%.3f", s->chord_coherence);
+        av_dict_set(&frame->metadata, "lavfi.keydetect.chord_coherence", buf, 0);
+    }
+    if (s->salience_hops > 0) {
+        snprintf(buf, sizeof(buf), "%.3f",
+                 s->salience_sum / s->salience_hops);
+        av_dict_set(&frame->metadata, "lavfi.keydetect.tonalness", buf, 0);
+    }
+    if (s->bass) {
+        int bt = bass_tonic(s);
+        if (bt >= 0) {
+            av_dict_set(&frame->metadata, "lavfi.keydetect.bass_tonic",
+                        pitch_names[bt], 0);
+            bass_string(s, buf, sizeof(buf));
+            av_dict_set(&frame->metadata, "lavfi.keydetect.bass_chroma", buf, 0);
+        }
     }
     if (s->stable_label != INT_MIN) {
         chord_name(s->stable_label, buf, sizeof(buf));
@@ -821,41 +1248,61 @@ static void set_frame_metadata(KeyDetectContext *s, AVFrame *frame)
     }
 }
 
+/* Every final field goes to the log and to stderr, where consumers parse the
+ * closing block. Fields are emitted in one place so that adding one cannot
+ * leave the two streams disagreeing. */
+static void emit_kv(AVFilterContext *ctx, const char *key, const char *val)
+{
+    av_log(ctx, AV_LOG_INFO, "lavfi.keydetect.%s=%s\n", key, val);
+    fprintf(stderr, "lavfi.keydetect.%s=%s\n", key, val);
+}
+
 static void emit_final(AVFilterContext *ctx)
 {
     KeyDetectContext *s = ctx->priv;
     char buf[PROG_STR_SIZE];
 
     if (s->key_index >= 0) {
+        fprintf(stderr, "\n");
         key_name(s->key_index, buf, sizeof(buf));
-        av_log(ctx, AV_LOG_INFO, "lavfi.keydetect.key=%s\n", buf);
-        fprintf(stderr, "\nlavfi.keydetect.key=%s\n", buf);
+        emit_kv(ctx, "key", buf);
         snprintf(buf, sizeof(buf), "%.3f", s->key_confidence);
-        av_log(ctx, AV_LOG_INFO, "lavfi.keydetect.key_confidence=%s\n", buf);
-        fprintf(stderr, "lavfi.keydetect.key_confidence=%s\n", buf);
+        emit_kv(ctx, "key_confidence", buf);
+        snprintf(buf, sizeof(buf), "%.3f", s->key_r[s->key_lead]);
+        emit_kv(ctx, "key_r_leader", buf);
         if (s->key_rank[1] >= 0) {
             key_name(s->key_rank[1], buf, sizeof(buf));
-            av_log(ctx, AV_LOG_INFO, "lavfi.keydetect.key_alt=%s\n", buf);
-            fprintf(stderr, "lavfi.keydetect.key_alt=%s\n", buf);
+            emit_kv(ctx, "key_alt", buf);
             snprintf(buf, sizeof(buf), "%.3f", s->key_r[s->key_rank[1]]);
-            av_log(ctx, AV_LOG_INFO,
-                   "lavfi.keydetect.key_alt_confidence=%s\n", buf);
-            fprintf(stderr, "lavfi.keydetect.key_alt_confidence=%s\n", buf);
+            emit_kv(ctx, "key_alt_confidence", buf);
         }
         snprintf(buf, sizeof(buf), "%.3f", s->key_margin);
-        av_log(ctx, AV_LOG_INFO, "lavfi.keydetect.key_margin=%s\n", buf);
-        fprintf(stderr, "lavfi.keydetect.key_margin=%s\n", buf);
+        emit_kv(ctx, "key_margin", buf);
         candidates_string(s, buf, sizeof(buf));
-        av_log(ctx, AV_LOG_INFO, "lavfi.keydetect.key_candidates=%s\n", buf);
-        fprintf(stderr, "lavfi.keydetect.key_candidates=%s\n", buf);
-        av_log(ctx, AV_LOG_INFO, "lavfi.keydetect.key_reranked=%d\n",
-               s->reranked);
-        fprintf(stderr, "lavfi.keydetect.key_reranked=%d\n", s->reranked);
+        emit_kv(ctx, "key_candidates", buf);
+        snprintf(buf, sizeof(buf), "%d", s->reranked);
+        emit_kv(ctx, "key_reranked", buf);
+        profiles_string(s, buf, sizeof(buf));
+        if (buf[0])
+            emit_kv(ctx, "key_profiles", buf);
+        snprintf(buf, sizeof(buf), "%.3f", s->chord_coherence);
+        emit_kv(ctx, "chord_coherence", buf);
+    }
+    if (s->salience_hops > 0) {
+        snprintf(buf, sizeof(buf), "%.3f", s->salience_sum / s->salience_hops);
+        emit_kv(ctx, "tonalness", buf);
+    }
+    if (s->bass) {
+        int bt = bass_tonic(s);
+        if (bt >= 0) {
+            emit_kv(ctx, "bass_tonic", pitch_names[bt]);
+            bass_string(s, buf, sizeof(buf));
+            emit_kv(ctx, "bass_chroma", buf);
+        }
     }
     if (s->progression_len > 0) {
         progression_string(s, buf, sizeof(buf), PROGRESSION_MAX);
-        av_log(ctx, AV_LOG_INFO, "lavfi.keydetect.chords=%s\n", buf);
-        fprintf(stderr, "lavfi.keydetect.chords=%s\n", buf);
+        emit_kv(ctx, "chords", buf);
     }
 }
 
