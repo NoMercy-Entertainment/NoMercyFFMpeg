@@ -5,6 +5,10 @@ if [[ "${ARCH}" == "aarch64" && "${TARGET_OS}" == "linux" ]]; then
     export OPENSSL_TARGET="linux-aarch64"
 elif [[ "${ARCH}" == "x86_64" && "${TARGET_OS}" == "windows" ]]; then
     export OPENSSL_TARGET="mingw64"
+elif [[ "${ARCH}" == "aarch64" && "${TARGET_OS}" == "windows" ]]; then
+    # Without this the default at the top (linux-x86_64) would be used, which
+    # silently configures a Linux build with the mingw cross compiler.
+    export OPENSSL_TARGET="mingwarm64"
 elif [[ "${TARGET_OS}" == "darwin" ]]; then
     export OPENSSL_TARGET="darwin64-${ARCH}-cc"
 elif [[ "${TARGET_OS}" == "freebsd" ]]; then

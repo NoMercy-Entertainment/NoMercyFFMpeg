@@ -1,5 +1,36 @@
 #!/bin/bash
 
+if [[ ${TARGET_OS} == "windows" && ${ARCH} == "aarch64" ]]; then
+    # aec*.c pick an MSVC inline-asm implementation of aec_get_shift() behind
+    #     #if SYS_WINDOWS && !ARCH_X86_64
+    # which was written when "Windows but not x86_64" could only mean 32-bit
+    # x86. On Windows-on-ARM it is also true, so an aarch64 build selects
+    #     __asm { bsr eax, v }
+    # i.e. x86 assembly, in a syntax clang does not accept at all:
+    #     error: expected 'volatile', 'inline', 'goto', or '('
+    # Narrow the condition to what it actually means so aarch64 takes the
+    # portable C branch that already exists in the #else.
+    # NB: these sources are CRLF, so the guard line ends "...ARCH_X86_64\r".
+    # Do not anchor with $ -- it will not match, and the replacement silently
+    # does nothing. Leaving the tail unanchored keeps the CR in place.
+    for f in aec.c aec_ctx.c aec_rdo.c aec_vrdo.c aec_fastrdo.c; do
+        sed -i 's|^#if SYS_WINDOWS && !ARCH_X86_64|#if SYS_WINDOWS \&\& !ARCH_X86_64 \&\& !defined(__aarch64__)|' \
+            "/build/libxavs2/source/encoder/${f}"
+    done
+    # Assert on what the patch ADDS, not on the absence of the old pattern:
+    # an absence check passes vacuously if the match never happened.
+    for f in aec.c aec_ctx.c aec_rdo.c aec_vrdo.c aec_fastrdo.c; do
+        grep -q 'defined(__aarch64__)' "/build/libxavs2/source/encoder/${f}" || {
+            log "xavs2: aec x86-asm guard patch did not apply to ${f}"
+            exit 1
+        }
+    done
+
+    # Same hard error FreeBSD hits below: clang rejects the encoder's
+    # thread-entry function pointer mismatch by default.
+    export CFLAGS="${CFLAGS} -Wno-incompatible-function-pointer-types"
+fi
+
 if [[ ${TARGET_OS} == "freebsd" ]]; then
     # pthread_{set,get}affinity_np are declared in <pthread_np.h> on FreeBSD
     sed -i '0,/^#include/s//#include <pthread.h>\n#include <pthread_np.h>\n&/' /build/libxavs2/source/common/threadpool.c

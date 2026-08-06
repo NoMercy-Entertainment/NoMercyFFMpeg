@@ -52,17 +52,17 @@ services:
       - tmp:/tmp
       - ./output:/output
 
-  # ffmpeg-windows-arm64:
-  #   container_name: ffmpeg-windows-arm64
-  #   privileged: true
-  #   build:
-  #     context: .
-  #     dockerfile: ffmpeg-windows-arm64.dockerfile
-  #   depends_on:
-  #     - ffmpeg-base
-  #   volumes:
-  #     - tmp:/tmp
-  #     - ./output:/output
+  ffmpeg-windows-aarch64:
+    container_name: ffmpeg-windows-aarch64
+    privileged: true
+    build:
+      context: .
+      dockerfile: ffmpeg-windows-aarch64.dockerfile
+    depends_on:
+      - ffmpeg-base
+    volumes:
+      - tmp:/tmp
+      - ./output:/output
 
   ffmpeg-darwin-x86_64:
     container_name: ffmpeg-darwin-x86_64

@@ -30,9 +30,47 @@ Our build system uses a modular Docker-based approach: a shared base image ([ffm
 | **Windows** | x86_64 | ✅ |
 | **macOS** | x86_64, Apple Silicon (ARM64) | ✅ |
 | **FreeBSD** | x86_64 | ✅ |
-| **Windows** | ARM64 | ⚠️ Dockerfile available, not yet in CI |
+| **Windows** | ARM64 (aarch64) | ⚠️ Builds locally, not in CI — see below |
 
 Each release ships `ffmpeg`, `ffprobe`, and `ffplay` (where built) as fully static binaries per platform.
+
+### Windows on ARM (windows-aarch64)
+
+`ffmpeg-windows-aarch64.dockerfile` builds a complete FFmpeg for Windows-on-ARM and
+is wired into `docker-compose.yml`, so `docker compose build ffmpeg-windows-aarch64`
+works locally. It is deliberately **not** in the CI matrix and ships in no release.
+
+It uses a different toolchain from every other platform: llvm-mingw (clang/lld)
+rather than GCC, because the GCC cross-compiler for this target crashes on
+`-fstack-protector-strong` and ships a CRT header that does not parse.
+
+The reason it is not released is verification, not the build. The artifact has
+only been checked structurally — correct ARM64 PE, expected version string, all
+filters/muxers linked in. It has never been executed, because that needs real
+Windows-on-ARM hardware. `.github/scripts/sync-checklist.js` will not tick a
+platform box without a verdict from hardware that can actually run the binary,
+which is the correct behaviour: adding this platform to the release matrix
+before then would block every release PR on a box that can never be ticked.
+
+Windows-on-ARM users are not blocked meanwhile: the `windows-x86_64` build runs
+under Windows' x64 emulation. A native build is a performance improvement.
+
+To promote it to a released platform, once hardware (or a `windows-11-arm` CI
+runner) is available: add `windows-aarch64` to `ALL_PLATFORMS` in
+`.github/workflows/detect-changes.yml`, to the platform list in
+`.github/scripts/sync-checklist.js`, to the checklist in
+`.github/PULL_REQUEST_TEMPLATE.md`, and to `PLATFORMS` in
+`clients/npm/src/platform.ts` (key `win32-arm64`, slug `windows-aarch64`).
+
+Capability differences from `windows-x86_64`, all deliberate:
+
+| Component | windows-x86_64 | windows-aarch64 | Why |
+|---|---|---|---|
+| NVENC / CUDA / AMF / QSV | ✅ | ➖ | No NVIDIA, AMD or Intel GPU exists on Windows-on-ARM |
+| OpenBLAS (whisper) | ✅ | ➖ | Builds x86 kernels regardless of `TARGET`; whisper falls back to ggml's own kernels, as on linux/darwin/freebsd |
+| SVT-AV1 dotprod/i8mm | n/a | ➖ | Optional aarch64 extension kernels; baseline NEON is on. Enabling them would raise the hardware floor for every WoA device |
+| Everything else | ✅ | ✅ | x264, x265, AV1, VPx, opus, xavs2, zimg, Vulkan, and all NoMercy filters/muxers |
+
 
 ### Build Features
 - 🔒 **Security Scanning**: Trivy vulnerability assessment on all platform images

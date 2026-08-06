@@ -39,6 +39,17 @@ rm -rf /build/leptonica && cd /build
 
 #region libtesseract
 cd /build/libtesseract
+
+if [[ ${TARGET_OS} == "windows" && ${ARCH} == "aarch64" ]]; then
+    # simddetect.cpp calls getenv() but only includes <numeric> and project
+    # headers. libstdc++ happens to drag <cstdlib> in transitively, so the GCC
+    # platforms build; libc++ (this target's C++ library) does not, giving
+    #   error: use of undeclared identifier 'getenv'; did you mean '_wgetenv'?
+    # Include it explicitly rather than relying on a transitive include.
+    sed -i '/^#include <numeric>/a #include <cstdlib> // for getenv' src/arch/simddetect.cpp
+    grep -q '^#include <cstdlib>' src/arch/simddetect.cpp || { log -a "libtesseract: simddetect.cpp cstdlib patch did not apply"; exit 1; }
+fi
+
 if [[ ${TARGET_OS} == "darwin" && ${ARCH} == "x86_64" ]]; then
     sed -i '/#include <filesystem>/d' src/ccutil/ccutil.cpp
     sed -i 's/#include <cstring>/#include <cstring> \n#include <sys\/stat.h> \n#include <unistd.h>/' src/ccutil/ccutil.cpp
