@@ -80,6 +80,10 @@ jobs:
           ORG: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+          # windows-aarch64 is a released platform but is NOT required here:
+          # no Windows-on-ARM machine is in the fleet, so listing it would
+          # report the fleet permanently unhealthy for a runner nobody has.
+          # Add it here at the same time as the verify-rc.yml matrix entry.
           REQUIRED="linux-x86_64 linux-aarch64 windows-x86_64 darwin-x86_64 darwin-arm64 freebsd-driver"
 
           if ! gh api "orgs/${ORG}/actions/runners" --jq '.runners' > runners.json 2>/dev/null; then

@@ -28,7 +28,7 @@ on:
 # Single source of truth for the platform list. Anything that needs to know
 # about platforms (this workflow, the matrix in main.yml) reads it from here.
 env:
-  ALL_PLATFORMS: "linux-x86_64 linux-aarch64 windows-x86_64 darwin-x86_64 darwin-arm64 freebsd-x86_64"
+  ALL_PLATFORMS: "linux-x86_64 linux-aarch64 windows-x86_64 windows-aarch64 darwin-x86_64 darwin-arm64 freebsd-x86_64"
 
 jobs:
   detect-changes:
@@ -77,10 +77,14 @@ jobs:
           # only verify the archive extracts, smoke.sh handles the cross-arch skip.
           # freebsd-x86_64 has no GitHub-hosted runner; like linux-aarch64 it
           # runs on ubuntu-latest where smoke.sh downgrades to a presence check.
+          # windows-aarch64 runs on windows-latest, which is x64: it cannot
+          # execute an ARM64 PE any more than ubuntu can, so smoke.ps1 does the
+          # same cross-exec downgrade and validates the PE header instead.
           declare -A OS=(
             [linux-x86_64]=ubuntu-latest
             [linux-aarch64]=ubuntu-latest
             [windows-x86_64]=windows-latest
+            [windows-aarch64]=windows-latest
             [darwin-x86_64]=macos-15-intel
             [darwin-arm64]=macos-latest
             [freebsd-x86_64]=ubuntu-latest
@@ -89,6 +93,7 @@ jobs:
             [linux-x86_64]=tar.gz
             [linux-aarch64]=tar.gz
             [windows-x86_64]=zip
+            [windows-aarch64]=zip
             [darwin-x86_64]=tar.gz
             [darwin-arm64]=tar.gz
             [freebsd-x86_64]=tar.gz
@@ -97,6 +102,7 @@ jobs:
             [linux-x86_64]=unix
             [linux-aarch64]=unix
             [windows-x86_64]=windows
+            [windows-aarch64]=windows
             [darwin-x86_64]=unix
             [darwin-arm64]=unix
             [freebsd-x86_64]=unix

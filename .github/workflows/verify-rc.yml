@@ -162,6 +162,20 @@ jobs:
             ext: zip
             labels: '["self-hosted","ffmpeg-verify","windows-x86_64"]'
             via: windows
+          # windows-aarch64 is built and released but is deliberately absent
+          # here: there is no Windows-on-ARM machine in the verify fleet, and an
+          # entry whose labels no runner carries does not fail — it queues until
+          # the job times out, holding up the whole RC verification.
+          #
+          # The consequence is intended and visible: no verdict file is produced
+          # for windows-aarch64, so sync-checklist.js leaves its box unticked and
+          # the release PR stays blocked until a human tests it. That is the
+          # honest state, not a gap to paper over.
+          #
+          # To wire it up, add a runner labelled
+          #   ["self-hosted","ffmpeg-verify","windows-aarch64"]
+          # and add the matrix entry below with `via: windows`. tests/tests.ps1
+          # already runs there unchanged.
     runs-on: ${{ fromJSON(matrix.labels) }}
     timeout-minutes: 45
     steps:

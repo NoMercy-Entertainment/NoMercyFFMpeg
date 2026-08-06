@@ -121,6 +121,7 @@ jobs:
             [linux-x86_64]=tar.gz
             [linux-aarch64]=tar.gz
             [windows-x86_64]=zip
+            [windows-aarch64]=zip
             [darwin-x86_64]=tar.gz
             [darwin-arm64]=tar.gz
             [freebsd-x86_64]=tar.gz
@@ -197,7 +198,7 @@ jobs:
       - name: Smoke test (windows)
         if: matrix.kind == 'windows'
         shell: pwsh
-        run: ./tests/smoke.ps1 -Workspace $env:GITHUB_WORKSPACE -ExpectedVersion $env:FFMPEG_VERSION
+        run: ./tests/smoke.ps1 -Workspace $env:GITHUB_WORKSPACE -ExpectedVersion $env:FFMPEG_VERSION -Platform "${{ matrix.platform }}"
 
   # ── Publish/refresh the Release Candidate prerelease (release PR only) ───
   # Gives contributors version-stamped binaries to test manually on each

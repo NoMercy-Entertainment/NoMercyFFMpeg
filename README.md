@@ -30,37 +30,49 @@ Our build system uses a modular Docker-based approach: a shared base image ([ffm
 | **Windows** | x86_64 | ✅ |
 | **macOS** | x86_64, Apple Silicon (ARM64) | ✅ |
 | **FreeBSD** | x86_64 | ✅ |
-| **Windows** | ARM64 (aarch64) | ⚠️ Builds locally, not in CI — see below |
+| **Windows** | ARM64 (aarch64) | ✅ ⚠️ see below |
 
 Each release ships `ffmpeg`, `ffprobe`, and `ffplay` (where built) as fully static binaries per platform.
 
 ### Windows on ARM (windows-aarch64)
 
-`ffmpeg-windows-aarch64.dockerfile` builds a complete FFmpeg for Windows-on-ARM and
-is wired into `docker-compose.yml`, so `docker compose build ffmpeg-windows-aarch64`
-works locally. It is deliberately **not** in the CI matrix and ships in no release.
+Built and released like every other platform, with one difference that matters:
+**no automated test ever executes it.**
 
-It uses a different toolchain from every other platform: llvm-mingw (clang/lld)
-rather than GCC, because the GCC cross-compiler for this target crashes on
+It uses a different toolchain from the rest — llvm-mingw (clang/lld) rather than
+GCC, because the GCC cross-compiler for this target crashes on
 `-fstack-protector-strong` and ships a CRT header that does not parse.
 
-The reason it is not released is verification, not the build. The artifact has
-only been checked structurally — correct ARM64 PE, expected version string, all
-filters/muxers linked in. It has never been executed, because that needs real
-Windows-on-ARM hardware. `.github/scripts/sync-checklist.js` will not tick a
-platform box without a verdict from hardware that can actually run the binary,
-which is the correct behaviour: adding this platform to the release matrix
-before then would block every release PR on a box that can never be ticked.
+Nothing in CI can run an ARM64 Windows binary. `windows-latest` is x64, and
+Windows-on-ARM emulates x64 rather than the reverse, so `tests/smoke.ps1`
+downgrades to validating the PE header (`Machine == 0xAA64`) instead of
+executing — the same treatment `smoke.sh` gives `linux-aarch64` and
+`freebsd-x86_64`. That proves the artifact is a well-formed ARM64 binary
+carrying the expected symbols. It does not prove it decodes a single frame.
 
-Windows-on-ARM users are not blocked meanwhile: the `windows-x86_64` build runs
-under Windows' x64 emulation. A native build is a performance improvement.
+There is also no Windows-on-ARM machine in the verify fleet, so `verify-rc.yml`
+produces no verdict for it and `sync-checklist.js` leaves its checklist box
+unticked. **A release PR therefore stays blocked until a human runs
+`tests/tests.ps1` on real hardware and records a verdict.** That is deliberate:
+the box is the only thing standing between an unexecuted binary and a release.
 
-To promote it to a released platform, once hardware (or a `windows-11-arm` CI
-runner) is available: add `windows-aarch64` to `ALL_PLATFORMS` in
-`.github/workflows/detect-changes.yml`, to the platform list in
-`.github/scripts/sync-checklist.js`, to the checklist in
-`.github/PULL_REQUEST_TEMPLATE.md`, and to `PLATFORMS` in
-`clients/npm/src/platform.ts` (key `win32-arm64`, slug `windows-aarch64`).
+When running it by hand, pass the platform explicitly:
+
+```powershell
+.\tests\tests.ps1 -Workspace <extracted-dir> -Platform windows-aarch64
+```
+
+`-Platform` defaults to `windows-x86_64`, so omitting it produces a verdict
+labelled for the wrong platform — which `sync-checklist.js` will then match
+against the wrong checklist box.
+
+To close the gap, add a runner labelled
+`["self-hosted","ffmpeg-verify","windows-aarch64"]`, then add the matrix entry
+in `.github/workflows/verify-rc.yml` and the name in the `REQUIRED` list in
+`.github/workflows/fleet-health.yml`. Both carry comments pointing back here.
+
+Meanwhile Windows-on-ARM users are not stranded: the `windows-x86_64` build runs
+under Windows' x64 emulation. The native build is a performance improvement.
 
 Capability differences from `windows-x86_64`, all deliberate:
 
@@ -70,7 +82,6 @@ Capability differences from `windows-x86_64`, all deliberate:
 | OpenBLAS (whisper) | ✅ | ➖ | Builds x86 kernels regardless of `TARGET`; whisper falls back to ggml's own kernels, as on linux/darwin/freebsd |
 | SVT-AV1 dotprod/i8mm | n/a | ➖ | Optional aarch64 extension kernels; baseline NEON is on. Enabling them would raise the hardware floor for every WoA device |
 | Everything else | ✅ | ✅ | x264, x265, AV1, VPx, opus, xavs2, zimg, Vulkan, and all NoMercy filters/muxers |
-
 
 ### Build Features
 - 🔒 **Security Scanning**: Trivy vulnerability assessment on all platform images
@@ -93,12 +104,14 @@ graph TD
     E --> F[Linux x86_64]
     E --> G[Linux aarch64]
     E --> H[Windows x86_64]
+    E --> H2[Windows ARM64]
     E --> I[macOS x86_64]
     E --> J[macOS ARM64]
     E --> K[FreeBSD x86_64]
     F --> L[Export Artifacts]
     G --> L
     H --> L
+    H2 --> L
     I --> L
     J --> L
     K --> L

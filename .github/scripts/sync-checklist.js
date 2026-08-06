@@ -19,7 +19,7 @@ const COMMENT_MARKER = '<!-- RC-VERIFICATION-REPORT -->';
 // Maps a checklist line to the verdict that is allowed to tick it. The hardware
 // line is special: it is satisfied by acceleration actually exercised somewhere
 // in the fleet, not by one platform.
-const PLATFORM_LINE = /^(linux-x86_64|linux-aarch64|windows-x86_64|darwin-x86_64|darwin-arm64|freebsd-x86_64)\b/;
+const PLATFORM_LINE = /^(linux-x86_64|linux-aarch64|windows-x86_64|windows-aarch64|darwin-x86_64|darwin-arm64|freebsd-x86_64)\b/;
 const HARDWARE_LINE = /hardware acceleration/i;
 const ACCELERATORS = ['nvenc', 'amf', 'vpl', 'videotoolbox'];
 
@@ -225,7 +225,7 @@ function main() {
   const verdicts = readVerdicts(directory);
   const results = new Map();
   for (const platform of [
-    'linux-x86_64', 'linux-aarch64', 'windows-x86_64',
+    'linux-x86_64', 'linux-aarch64', 'windows-x86_64', 'windows-aarch64',
     'darwin-x86_64', 'darwin-arm64', 'freebsd-x86_64',
   ]) {
     const verdict = verdicts.get(platform);
@@ -301,4 +301,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { assess, assessHardware, rewriteChecklist, buildComment, readVerdicts };
+module.exports = { assess, assessHardware, rewriteChecklist, buildComment, readVerdicts, PLATFORM_LINE };

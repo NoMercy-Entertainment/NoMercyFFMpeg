@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { assess, assessHardware, rewriteChecklist } = require('./sync-checklist');
+const { assess, assessHardware, rewriteChecklist, PLATFORM_LINE } = require('./sync-checklist');
 
 const HEAD = 'a'.repeat(40);
 const CONTEXT = { headSha: HEAD, tag: 'v1.0.39-rc' };
@@ -107,6 +107,34 @@ assert.match(rewritten, /- \[ \] a stray box above/, 'leaves boxes above the mar
 assert.match(rewritten, /- \[ \] a stray box below/, 'leaves boxes below the markers alone');
 
 assert.strictEqual(rewriteChecklist('no markers', () => true), null, 'refuses a body with no delimiters');
+
+// Every platform in the build matrix must be recognised by PLATFORM_LINE.
+// A platform the regex does not match is reported as an unrecognised line and
+// left untouched forever, so its box can never be ticked and the merge stays
+// blocked with no way out -- which looks identical to "hardware not tested yet"
+// and is why this is asserted rather than left to review.
+// Assert against PLATFORM_LINE itself. Driving rewriteChecklist with a
+// `() => true` callback would pass whatever the regex says, because the
+// PLATFORM_LINE match lives in main()'s callback rather than in
+// rewriteChecklist -- a test shaped that way still passes with a platform
+// missing from the regex, which is the failure it is supposed to catch.
+for (const platform of [
+  'linux-x86_64', 'linux-aarch64', 'windows-x86_64', 'windows-aarch64',
+  'darwin-x86_64', 'darwin-arm64', 'freebsd-x86_64',
+]) {
+  const label = `${platform} — tested on real hardware, \`tests/tests.sh\` ✓, version correct`;
+  const match = label.match(PLATFORM_LINE);
+  assert.ok(match, `${platform} is recognised by PLATFORM_LINE`);
+  assert.strictEqual(match[1], platform, `${platform} captures its own name, not a prefix of it`);
+}
+
+// linux-aarch64 must not be captured as linux-x86_64 etc: the capture group
+// keys the results lookup, so a prefix match would tick the wrong platform.
+assert.strictEqual(
+  'windows-aarch64 — tested'.match(PLATFORM_LINE)[1],
+  'windows-aarch64',
+  'windows-aarch64 is not shadowed by windows-x86_64',
+);
 
 // A human-ticked line the script does not recognise must survive. Clearing it
 // blocks the merge in check-checklist.js and gets cleared again on every push,

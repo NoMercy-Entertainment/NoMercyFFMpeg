@@ -33,6 +33,7 @@ Every client, regardless of language, implements the same four-step resolve:
 | OS | Arch | slug | ext | binaries |
 | --- | --- | --- | --- | --- |
 | Windows | x64 | `windows-x86_64` | `zip` | `ffmpeg.exe`, `ffprobe.exe` |
+| Windows | arm64 | `windows-aarch64` | `zip` | `ffmpeg.exe`, `ffprobe.exe` |
 | Linux | x64 | `linux-x86_64` | `tar.gz` | `ffmpeg`, `ffprobe` |
 | Linux | arm64 | `linux-aarch64` | `tar.gz` | `ffmpeg`, `ffprobe` |
 | macOS | arm64 | `darwin-arm64` | `tar.gz` | `ffmpeg`, `ffprobe` |

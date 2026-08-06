@@ -71,9 +71,10 @@ docker compose run   --rm             ffmpeg-linux-aarch64
 docker compose build --progress=plain ffmpeg-windows-x86_64
 docker compose run   --rm             ffmpeg-windows-x86_64
 
-# Windows on ARM. Builds locally but is not in the CI matrix and ships in no
-# release — it has never been run on real hardware. See the "Windows on ARM"
-# section in README.md before promoting it.
+# Windows on ARM. Built and released like the rest, but nothing in CI executes
+# it (no runner can run an ARM64 PE) and there is no machine in the verify
+# fleet, so its release-checklist box only ticks when a human runs
+# tests/tests.ps1 on real hardware. See "Windows on ARM" in README.md.
 docker compose build --progress=plain ffmpeg-windows-aarch64
 docker compose run   --rm             ffmpeg-windows-aarch64
 
