@@ -22,6 +22,21 @@ if [[ "${TARGET_OS}" == "darwin" ]]; then
 	HARFBUZZ_EXTRA_FLAGS="-Dcoretext=enabled -Dgpu=disabled"
 fi
 
+if [[ "${TARGET_OS}" == "windows" && "${ARCH}" == "aarch64" ]]; then
+	# This target builds with llvm-mingw (clang). src/hb.hh promotes 35 warnings
+	# to hard errors via "#pragma GCC diagnostic error", and clang warns about
+	# things GCC does not -- -Wunused-template fires throughout hb-algs.hh, so
+	# upstream's own headers fail to compile. The code is fine; only the warning
+	# set differs.
+	#
+	# It has to be patched in the source: a diagnostic pragma overrides the
+	# command line, so neither -Wno-unused-template nor meson's -Dwerror=false
+	# has any effect (the compile line never carries -Werror to begin with).
+	# Downgrade error -> warning so they stay visible without being fatal.
+	sed -i 's|^#pragma GCC diagnostic error|#pragma GCC diagnostic warning|' src/hb.hh
+	grep -q '^#pragma GCC diagnostic error' src/hb.hh && { log -a "harfbuzz: hb.hh pragma downgrade failed"; exit 1; }
+fi
+
 meson build --prefix=${PREFIX} --buildtype=release -Ddefault_library=static \
 	${HARFBUZZ_EXTRA_FLAGS} \
 	--cross-file="/build/cross_file.txt" | log

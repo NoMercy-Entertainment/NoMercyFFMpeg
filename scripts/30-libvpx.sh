@@ -5,6 +5,9 @@ if [[ "${ARCH}" == "aarch64" && "${TARGET_OS}" == "linux" ]]; then
     export LIBVPX_TARGET="--target=arm64-linux-gcc"
 elif [[ "${ARCH}" == "x86_64" && "${TARGET_OS}" == "windows" ]]; then
     export LIBVPX_TARGET="--target=${ARCH}-win64-gcc"
+elif [[ "${ARCH}" == "aarch64" && "${TARGET_OS}" == "windows" ]]; then
+    # libvpx spells the Windows-on-ARM target arm64-win64-gcc, not aarch64-.
+    export LIBVPX_TARGET="--target=arm64-win64-gcc"
 elif [[ "${ARCH}" == "arm64" && "${TARGET_OS}" == "darwin" ]]; then
     export LIBVPX_TARGET="--target=${ARCH}-darwin23-gcc"
 elif [[ "${ARCH}" == "x86_64" && "${TARGET_OS}" == "darwin" ]]; then

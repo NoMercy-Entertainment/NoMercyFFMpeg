@@ -5,6 +5,12 @@ if [[ ${TARGET_OS} == "darwin" || ${TARGET_OS} == "freebsd" ]]; then
     exit 255
 fi
 
+if [[ ${TARGET_OS} == "windows" && ${ARCH} == "aarch64" ]]; then
+    # Windows-on-ARM devices carry Qualcomm Adreno or Nvidia/ARM parts, never
+    # an AMD GPU, so the AMF runtime this would bind to does not exist there.
+    exit 255
+fi
+
 cd /build/amf
 
 # FFmpeg 8's libavfilter/vsrc_amf.c (built as C) transitively includes these

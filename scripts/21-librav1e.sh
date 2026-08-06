@@ -7,7 +7,11 @@ elif [[ "${ARCH}" == "x86_64" && "${TARGET_OS}" == "windows" ]]; then
     LIBRAV1E_TARGET="--target=${ARCH}-pc-windows-gnu"
     export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=${CC}
 elif [[ "${ARCH}" == "aarch64" && "${TARGET_OS}" == "windows" ]]; then
-    LIBRAV1E_TARGET="--target=${ARCH}-pc-windows-msvc"
+    # gnullvm, not msvc: the toolchain is llvm-mingw, so there is no MSVC linker
+    # here. gnullvm is the Rust target that pairs with llvm-mingw, and it links
+    # through the same aarch64-w64-mingw32 driver everything else uses.
+    LIBRAV1E_TARGET="--target=${ARCH}-pc-windows-gnullvm"
+    export CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=${CC}
 elif [[ "${ARCH}" == "arm64" && "${TARGET_OS}" == "darwin" ]]; then
     LIBRAV1E_TARGET="--target=aarch64-apple-darwin"
 elif [[ "${ARCH}" == "x86_64" && "${TARGET_OS}" == "darwin" ]]; then

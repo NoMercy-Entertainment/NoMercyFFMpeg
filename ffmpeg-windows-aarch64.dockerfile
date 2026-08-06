@@ -44,21 +44,63 @@ RUN echo "------------------------------------------------------" \
 
 ENV PREFIX=/ffmpeg_build/windows
 
+# Windows-on-ARM toolchain: llvm-mingw (clang/LLD), not GCC.
+#
+# This used to build GCC from Windows-on-ARM-Experiments/mingw-woarm64-build.
+# That toolchain is research-grade and produced two hard blockers:
+#   1. ICE in the SEH backend on -fstack-protector-strong
+#      (gcc/config/mingw/winnt.cc:1492 seh_pattern_emit), so every library had
+#      to be built without stack-protector hardening.
+#   2. Its own CRT header does not parse in some translation units --
+#      _mingw.h:634 leaves __MINGW_FASTFAIL_INLINE unexpanded, which broke
+#      fribidi (and therefore libass, which requires it).
+#
+# llvm-mingw is the toolchain production Windows-on-ARM builds actually use.
+# It ships prebuilt (~85MB, no source build), provides the full
+# aarch64-w64-mingw32-* tool set including gcc/g++ wrappers so CROSS_PREFIX and
+# the shared scripts work unchanged, and supports stack-protector properly.
+# UCRT rather than MSVCRT: Windows-on-ARM is UCRT-only.
+#
+# Its C++ runtime is libc++, and it ships no libstdc++ at all. Many component
+# scripts write "Libs.private: -lstdc++" into their .pc files (x265, libpng,
+# giflib, lept, tesseract, spirv-cross, libplacebo, ...), which is correct for
+# every GCC platform. On this target -lstdc++ resolves to nothing, so any
+# pkg-config link test using those .pc files fails -- surfacing misleadingly as
+# FFmpeg's "ERROR: x265 not found using pkg-config" even though x265 built and
+# installed fine. Aliasing libstdc++.a to libc++.a below makes those flags
+# resolve to this toolchain's real C++ runtime, which is what they mean, and
+# keeps every shared script untouched.
+ARG LLVM_MINGW_VERSION=20260728
+ENV LLVM_MINGW_DIR=/opt/llvm-mingw
 RUN echo "------------------------------------------------------" \
-    && echo "🔧 Start downloading Windows-on-ARM" \
-    && git clone https://github.com/Windows-on-ARM-Experiments/mingw-woarm64-build.git >/dev/null 2>&1 \
-    && echo "✅ Windows-on-ARM source code downloaded successfully" \
-    && cd mingw-woarm64-build \
-    && find . -type f -exec sed -i 's|sudo ||g' {} + \
-    && echo "🔧 Start building Windows-on-ARM" \
-    && TOOLCHAIN_PATH=${PREFIX}/aarch64-w64-mingw32 ./build.sh >/dev/null 2>&1 \
-    && echo "✅ Windows-on-ARM installed successfully" \
+    && echo "🔧 Start downloading llvm-mingw ${LLVM_MINGW_VERSION} (Windows-on-ARM toolchain)" \
+    && TARBALL="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz" \
+    && curl -fsSL --retry 5 --retry-delay 5 -o /tmp/llvm-mingw.tar.xz \
+        "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${TARBALL}" \
+    && mkdir -p ${LLVM_MINGW_DIR} \
+    && tar -xJf /tmp/llvm-mingw.tar.xz -C ${LLVM_MINGW_DIR} --strip-components=1 \
+    && rm -f /tmp/llvm-mingw.tar.xz \
+    && echo "🔧 Verifying the toolchain" \
+    && ${LLVM_MINGW_DIR}/bin/aarch64-w64-mingw32-gcc --version | head -1 \
+    && printf '#include <stdlib.h>\nint main(void){return 0;}\n' > /tmp/probe.c \
+    && ${LLVM_MINGW_DIR}/bin/aarch64-w64-mingw32-gcc -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+        -c /tmp/probe.c -o /tmp/probe.o \
+    && rm -f /tmp/probe.c /tmp/probe.o \
+    && echo "🔧 Aliasing libstdc++ -> libc++" \
+    && for d in ${LLVM_MINGW_DIR}/aarch64-w64-mingw32/lib; do \
+        [ -f "$d/libc++.a" ] || { echo "libc++.a not found in $d"; exit 1; }; \
+        ln -sf libc++.a "$d/libstdc++.a"; \
+    done \
+    && printf 'int main(void){return 0;}\n' > /tmp/probe.cpp \
+    && ${LLVM_MINGW_DIR}/bin/aarch64-w64-mingw32-g++ /tmp/probe.cpp -lstdc++ -o /tmp/probe.exe \
+    && rm -f /tmp/probe.cpp /tmp/probe.exe \
+    && echo "✅ llvm-mingw installed; stack-protector and -lstdc++ both link" \
     && echo "------------------------------------------------------"
 
 # Install Rust and Cargo
 RUN echo "------------------------------------------------------" \
     && echo "🔄 Start installing Rust and Cargo" \
-    && rustup target add aarch64-pc-windows-msvc >/dev/null 2>&1 \
+    && rustup target add aarch64-pc-windows-gnullvm >/dev/null 2>&1 \
     && cargo install cargo-c >/dev/null 2>&1 \
     && echo "✅ Installations completed successfully" \
     && echo "------------------------------------------------------"
@@ -73,20 +115,38 @@ ENV CROSS_PREFIX=${ARCH}-w64-mingw32-
 ENV CC=${CROSS_PREFIX}gcc
 ENV CXX=${CROSS_PREFIX}g++
 ENV LD=${CROSS_PREFIX}ld
-ENV AR=${CROSS_PREFIX}gcc-ar
-ENV RANLIB=${CROSS_PREFIX}gcc-ranlib
+# llvm-mingw ships ar/ranlib/nm directly; the gcc-* LTO wrappers are GCC-only
+# and do not exist here, so use the plain tools.
+ENV AR=${CROSS_PREFIX}ar
+ENV RANLIB=${CROSS_PREFIX}ranlib
 ENV STRIP=${CROSS_PREFIX}strip
-ENV NM=${CROSS_PREFIX}gcc-nm
+ENV NM=${CROSS_PREFIX}nm
 ENV WINDRES=${CROSS_PREFIX}windres
 ENV DLLTOOL=${CROSS_PREFIX}dlltool
 ENV STAGE_CFLAGS="-fno-semantic-interposition" 
 ENV STAGE_CXXFLAGS="-fno-semantic-interposition"
 ENV PKG_CONFIG=pkg-config
 ENV PKG_CONFIG_PATH=${PREFIX}/lib/pkgconfig
-ENV PATH="${PREFIX}/bin:${PREFIX}/aarch64-w64-mingw32/bin:${PATH}"
-ENV CFLAGS="-static-libgcc -static-libstdc++ -I${PREFIX}/aarch64-w64-mingw32/include -I${PREFIX}/include -O2 -pipe -D_FORTIFY_SOURCE=2 -fstack-protector-strong"
-ENV CXXFLAGS="-static-libgcc -static-libstdc++ -I${PREFIX}/aarch64-w64-mingw32/include -I${PREFIX}/include -O2 -pipe -D_FORTIFY_SOURCE=2 -fstack-protector-strong"
-ENV LDFLAGS="-static-libgcc -static-libstdc++ -L${PREFIX}/aarch64-w64-mingw32/lib -L${PREFIX}/lib -O2 -pipe -fstack-protector-strong"
+ENV PATH="${PREFIX}/bin:${LLVM_MINGW_DIR}/bin:${PATH}"
+# -fstack-protector-strong is back, matching every other platform: the GCC ICE
+# that forced it out was a mingw-woarm64-build defect and clang handles it (the
+# toolchain install step above proves it compiles before we get this far).
+# The old -I/-L into ${PREFIX}/aarch64-w64-mingw32 are gone with that toolchain;
+# llvm-mingw carries its own sysroot under ${LLVM_MINGW_DIR}.
+# -static-libgcc/-static-libstdc++ are deliberately NOT in CFLAGS/CXXFLAGS here,
+# only in LDFLAGS. They are link-time flags: GCC ignores them silently when
+# compiling, but clang emits -Wunused-command-line-argument, and many configure
+# probes deliberately run with -Werror to make warnings fail the test. That
+# turns a harmless flag into a wrong answer:
+#   * libgcrypt configure.ac:1398 sets -Werror before its '__thread' probe, so
+#     detection said "no", HAVE_GCC_STORAGE_CLASS__THREAD went undefined, and
+#     fips.c failed with "use of undeclared identifier 'the_tc'".
+#   * meson's "usable header" check reported stdatomic.h unusable, surfacing as
+#     libvmaf's "Atomics not supported".
+# Linking still gets them via LDFLAGS.
+ENV CFLAGS="-I${PREFIX}/include -O2 -pipe -D_FORTIFY_SOURCE=2 -fstack-protector-strong"
+ENV CXXFLAGS="-I${PREFIX}/include -O2 -pipe -D_FORTIFY_SOURCE=2 -fstack-protector-strong"
+ENV LDFLAGS="-static-libgcc -static-libstdc++ -L${PREFIX}/lib -O2 -pipe -fstack-protector-strong"
 
 # Create the build directory
 RUN mkdir -p ${PREFIX}
@@ -112,10 +172,10 @@ RUN echo "[binaries]" > /build/cross_file.txt && \
     echo "endian = 'little'" >> /build/cross_file.txt && \
     echo "" >> /build/cross_file.txt && \
     echo "[properties]" >> /build/cross_file.txt && \
-    echo "c_args = ['-static-libgcc', '-static-libstdc++', '-I${PREFIX}/aarch64-w64-mingw32/include', '-I${PREFIX}/include', '-O2', '-pipe', '-D_FORTIFY_SOURCE=2', '-fstack-protector-strong']" >> /build/cross_file.txt && \
-    echo "cpp_args = ['-static-libgcc', '-static-libstdc++', '-I${PREFIX}/aarch64-w64-mingw32/include', '-I${PREFIX}/include', '-O2', '-pipe', '-D_FORTIFY_SOURCE=2', '-fstack-protector-strong']" >> /build/cross_file.txt && \
-    echo "c_link_args = ['-static-libgcc', '-static-libstdc++', '-L${PREFIX}/aarch64-w64-mingw32/lib', '-L${PREFIX}/lib', '-O2', '-pipe', '-fstack-protector-strong']" >> /build/cross_file.txt && \
-    echo "cpp_link_args = ['-static-libgcc', '-static-libstdc++', '-L${PREFIX}/aarch64-w64-mingw32/lib', '-L${PREFIX}/lib', '-O2', '-pipe', '-fstack-protector-strong']" >> /build/cross_file.txt
+    echo "c_args = ['-I${PREFIX}/include', '-O2', '-pipe', '-D_FORTIFY_SOURCE=2', '-fstack-protector-strong']" >> /build/cross_file.txt && \
+    echo "cpp_args = ['-I${PREFIX}/include', '-O2', '-pipe', '-D_FORTIFY_SOURCE=2', '-fstack-protector-strong']" >> /build/cross_file.txt && \
+    echo "c_link_args = ['-static-libgcc', '-static-libstdc++', '-L${PREFIX}/lib', '-O2', '-pipe', '-fstack-protector-strong']" >> /build/cross_file.txt && \
+    echo "cpp_link_args = ['-static-libgcc', '-static-libstdc++', '-L${PREFIX}/lib', '-O2', '-pipe', '-fstack-protector-strong']" >> /build/cross_file.txt
 
 ENV CMAKE_COMMON_ARG="-DCMAKE_INSTALL_PREFIX=${PREFIX} -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=${ARCH} -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX} -DCMAKE_RC_COMPILER=${WINDRES} -DENABLE_SHARED=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release"
 
@@ -180,7 +240,7 @@ RUN FFMPEG_ENABLES=$(cat /build/enable.txt) export FFMPEG_ENABLES \
     --extra-cflags="-static -static-libgcc -static-libstdc++" \
     --extra-ldflags="-static -static-libgcc -static-libstdc++" \
     --extra-libs="${FFMPEG_EXTRA_LIBFLAGS}" >/ffmpeg_build.log 2>&1 \
-    || (cat "/ffmpeg_build.log" ; echo "❌ FFmpeg build failed" ; false) \
+    || (cat "/ffmpeg_build.log" ; echo "--- ffbuild/config.log (tail) ---" ; tail -80 ffbuild/config.log 2>/dev/null ; echo "❌ FFmpeg build failed" ; false) \
     && echo "🛠️ Building FFmpeg                               [2/2]" \
     && make -j$(nproc) >/ffmpeg_build.log 2>&1 || (cat "/ffmpeg_build.log" ; echo "❌ FFmpeg build failed" ; exit 1) && make install >/dev/null 2>&1 \
     && rm -rf /build/ffmpeg \

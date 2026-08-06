@@ -165,6 +165,21 @@ if [[ ${TARGET_OS} != "darwin" ]]; then
     fi
 fi
 
+if [[ ${TARGET_OS} == "windows" && ${ARCH} == "aarch64" ]]; then
+    # x265's cmake writes Libs.private by prefixing -l onto every entry of the
+    # C++ implicit link list. Under llvm-mingw that list already contains the
+    # -l:libunwind.a form, so it emits the malformed "-l-l:libunwind.a", which
+    # names a library that cannot exist. ffmpeg then fails the x265 link probe
+    # and reports it as the far less obvious
+    #     ERROR: x265 not found using pkg-config
+    # Collapse the doubled prefix back to the -l: form it was meant to be.
+    sed -i 's|-l-l:|-l:|g' ${PREFIX}/lib/pkgconfig/x265.pc
+    if grep -q -- '-l-l:' ${PREFIX}/lib/pkgconfig/x265.pc; then
+        echo "Error: x265.pc still contains a doubled -l prefix" >/ffmpeg_build.log
+        exit 1
+    fi
+fi
+
 add_enable "--enable-libx265"
 
 exit 0

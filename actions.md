@@ -71,10 +71,11 @@ docker compose run   --rm             ffmpeg-linux-aarch64
 docker compose build --progress=plain ffmpeg-windows-x86_64
 docker compose run   --rm             ffmpeg-windows-x86_64
 
-# ffmpeg-windows-arm64 is currently commented out in docker-compose.yml.
-# Uncomment the service block there before building.
-# docker compose build --progress=plain ffmpeg-windows-arm64
-# docker compose run   --rm             ffmpeg-windows-arm64
+# Windows on ARM. Builds locally but is not in the CI matrix and ships in no
+# release — it has never been run on real hardware. See the "Windows on ARM"
+# section in README.md before promoting it.
+docker compose build --progress=plain ffmpeg-windows-aarch64
+docker compose run   --rm             ffmpeg-windows-aarch64
 
 docker compose build --progress=plain ffmpeg-darwin-x86_64
 docker compose run   --rm             ffmpeg-darwin-x86_64
