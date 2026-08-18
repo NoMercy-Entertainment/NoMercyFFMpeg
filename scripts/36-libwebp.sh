@@ -85,14 +85,29 @@ if [[ ${TARGET_OS} != "windows" ]]; then
         exit 1
     )
 else
-    make || (
-        log "Error: giflib make failed."
-        exit 1
-    )
-    make install || (
-        log "Error: giflib install failed."
-        exit 1
-    )
+    if [[ ${ARCH} == "aarch64" ]]; then
+        # giflib's Makefile links the shared libgif.so with -soname, an ELF-only
+        # flag. GNU ld only warns about it, so windows-x86_64 builds fine, but
+        # this target links with lld, which hard-errors:
+        #   lld: error: unknown argument: -soname
+        # make then dies before producing libgif.a. Only the static library and
+        # the header are consumed here, so build just the static target and skip
+        # `make install`, whose shared targets hit the same error. The
+        # gif_lib.h / libgif.a copies below install exactly what is needed.
+        make libgif.a || (
+            log "Error: giflib make failed."
+            exit 1
+        )
+    else
+        make || (
+            log "Error: giflib make failed."
+            exit 1
+        )
+        make install || (
+            log "Error: giflib install failed."
+            exit 1
+        )
+    fi
     if [ ! -f ${PREFIX}/include/gif_lib.h ]; then
         if [ -f gif_lib.h ]; then
             cp gif_lib.h ${PREFIX}/include/gif_lib.h

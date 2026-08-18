@@ -5,6 +5,12 @@ if [[ ${TARGET_OS} == "darwin" || ${TARGET_OS} == "freebsd" ]]; then
     exit 255
 fi
 
+if [[ ${TARGET_OS} == "windows" && ${ARCH} == "aarch64" ]]; then
+    # QSV is Intel-only and there is no Intel GPU behind a Windows-on-ARM
+    # device; oneVPL itself assumes an x86 target.
+    exit 255
+fi
+
 cd /build/libvpl
 mkdir -p build && cd build
 cmake -GNinja -S .. -B . \

@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
-ENV ffmpeg_version=8.1.2 \
+ENV ffmpeg_version=9.0 \
     iconv_version=1.19 \
     libxml2_version=2.15 \
     zlib_version=1.3.2 \
@@ -69,7 +69,7 @@ ENV ffmpeg_version=8.1.2 \
     frei0r_version=3.2.1 \
     libvpl_version=2.16.0 \
     libsvtav1_version=4.1.0 \
-    amf_version=1.5.0 \
+    amf_version=1.5.2 \
     nvcodec_version=13.0.19.0 \
     leptonica_version=1.87.0 \
     libtesseract_version=5.5.2 \
@@ -119,6 +119,7 @@ RUN echo "------------------------------------------------------" \
     flex \
     gettext \
     git \
+    glslang-tools \
     gperf \
     groff \
     libc6 \
@@ -128,7 +129,6 @@ RUN echo "------------------------------------------------------" \
     libxext-dev \
     nasm \
     ninja-build \
-    nvidia-cuda-toolkit \
     pkg-config \
     python3 \
     python3-pip \
@@ -140,7 +140,7 @@ RUN echo "------------------------------------------------------" \
     xtrans-dev \
     xutils-dev \
     yasm >/dev/null 2>&1 \
-    && apt-get upgrade -y >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
+    && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && echo "✅ Installations completed successfully" \
     && echo "------------------------------------------------------"
@@ -216,7 +216,10 @@ RUN \
 RUN \
     echo "------------------------------------------------------" \
     && echo "🔄 Start downloading freetype" \
-    && wget -O freetype.tar.gz https://download.savannah.gnu.org/releases/freetype/freetype-$(echo ${freetype_version} | tr '-' '.').tar.gz >/dev/null 2>&1 \
+    # savannah 302-redirects to a rotating mirror pool and some mirrors return
+    # 5xx, which wget reports as exit 8. Retry so one bad mirror does not kill
+    # the whole base build; each attempt re-follows the redirect afresh.
+    && wget --tries=5 --waitretry=5 --retry-on-http-error=500,502,503,504 -O freetype.tar.gz https://download.savannah.gnu.org/releases/freetype/freetype-$(echo ${freetype_version} | tr '-' '.').tar.gz >/dev/null 2>&1 \
     && tar -xzf freetype.tar.gz >/dev/null 2>&1 && rm freetype.tar.gz && mv freetype-$(echo ${freetype_version} | tr '-' '.') freetype \
     # && git clone --branch VER-${freetype_version} https://gitlab.freedesktop.org/freetype/freetype.git freetype >/dev/null 2>&1 \
     && echo "✅ Download completed successfully" \

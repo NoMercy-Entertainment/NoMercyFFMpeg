@@ -37,7 +37,7 @@ RUN echo "------------------------------------------------------" \
     && echo "🔧 Installing dependencies" \
     && apt-get install -y --no-install-recommends \
     gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libgit2-dev openjdk-11-jdk ant >/dev/null 2>&1 \
-    && apt-get upgrade -y >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
+    && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && echo "✅ Installations completed successfully" \
     && echo "------------------------------------------------------"
@@ -170,6 +170,6 @@ RUN chmod +x /scripts/init/package.sh && /scripts/init/package.sh
 
 FROM alpine:latest AS final
 
-COPY --from=linux /build/ffmpeg-8.1.2-linux-aarch64.tar.gz /build/ffmpeg-8.1.2-linux-aarch64.tar.gz
+COPY --from=linux /build/ffmpeg-9.0-linux-aarch64.tar.gz /build/ffmpeg-9.0-linux-aarch64.tar.gz
 
-CMD ["cp", "/build/ffmpeg-8.1.2-linux-aarch64.tar.gz", "/output"]
+CMD ["cp", "/build/ffmpeg-9.0-linux-aarch64.tar.gz", "/output"]

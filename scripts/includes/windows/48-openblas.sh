@@ -3,10 +3,24 @@ if [[ ${TARGET_OS} != "windows" ]]; then
     exit 255
 fi
 
+if [[ ${ARCH} == "aarch64" ]]; then
+    # OpenBLAS is skipped on Windows-on-ARM. With DYNAMIC_ARCH=ON its CMake
+    # enumerates the x86 kernel family regardless of TARGET ("Targeting the
+    # ATOM architecture", kernel_CORE2, cpuid.S, ...), which cannot assemble
+    # for aarch64. Setting TARGET=ARMV8 does not change that list.
+    #
+    # This costs nothing but BLAS acceleration inside the whisper filter:
+    # 48-whisper.sh enables BLAS only "if [[ -f ${PREFIX}/lib/libopenblas.a ]]",
+    # and OpenBLAS is a windows-only extra to begin with -- linux, darwin and
+    # freebsd already build whisper without it. Transcription still works, it
+    # just uses ggml's built-in kernels.
+    exit 255
+fi
+
 rm -f /ffmpeg_build.log
 touch /ffmpeg_build.log
 
-git clone --branch v0.3.30 https://github.com/OpenMathLib/OpenBLAS /build/OpenBLAS
+git clone --branch v0.3.34 https://github.com/OpenMathLib/OpenBLAS /build/OpenBLAS
 cd /build/OpenBLAS
 
 mkdir build && cd build

@@ -113,6 +113,13 @@ echo "Libs.private: -lstdc++" >>${PREFIX}/lib/pkgconfig/libplacebo.pc
 sed -i 's/-lshaderc_shared/-lshaderc_combined/' ${PREFIX}/lib/pkgconfig/libplacebo.pc
 rm -rf /build/libplacebo
 
-add_enable "--enable-vulkan --enable-libshaderc --enable-libplacebo"
+# FFmpeg 9.0 dropped --enable-libshaderc (and --enable-libglslang): it no longer
+# links a SPIR-V compiler library, it invokes a host glslc/glslangValidator
+# binary at build time to compile the Vulkan shaders. Passing the old flag is a
+# hard "Unknown option" configure failure. The host compiler comes from the
+# glslang-tools package installed in ffmpeg-base.dockerfile; without it
+# configure silently disables spirv_compiler and every *_vulkan filter with it.
+# shaderc is still built above because libplacebo links it (-Dshaderc=enabled).
+add_enable "--enable-vulkan --enable-libplacebo"
 
 exit 0

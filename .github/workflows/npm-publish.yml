@@ -68,8 +68,10 @@ jobs:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Ensure npm supports trusted publishing
-        run: npm install -g npm@latest
+      # Do NOT self-upgrade npm here (`npm install -g npm@latest`): overwriting
+      # the toolcache npm in place leaves a broken install — `npm publish
+      # --provenance` then fails with MODULE_NOT_FOUND for 'sigstore'. The npm
+      # bundled with Node 24 already supports trusted publishing + provenance.
 
       - name: Install dependencies
         run: npm install

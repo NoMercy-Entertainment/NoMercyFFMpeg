@@ -37,7 +37,7 @@ RUN echo "------------------------------------------------------" \
     && echo "🔧 Installing dependencies" \
     && apt-get install -y --no-install-recommends \
     clang patch liblzma-dev libxml2-dev xz-utils bzip2 cpio zlib1g-dev libgit2-dev openjdk-11-jdk ant >/dev/null 2>&1 \
-    && apt-get upgrade -y >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
+    && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && echo "✅ Installations completed successfully" \
     && echo "------------------------------------------------------"
@@ -227,6 +227,6 @@ RUN chmod +x /scripts/init/package.sh && /scripts/init/package.sh
 
 FROM alpine:latest AS final
 
-COPY --from=darwin /output/ffmpeg-8.1.2-darwin-arm64.tar.gz /build/ffmpeg-8.1.2-darwin-arm64.tar.gz
+COPY --from=darwin /output/ffmpeg-9.0-darwin-arm64.tar.gz /build/ffmpeg-9.0-darwin-arm64.tar.gz
 
-CMD ["cp", "/build/ffmpeg-8.1.2-darwin-arm64.tar.gz", "/output"]
+CMD ["cp", "/build/ffmpeg-9.0-darwin-arm64.tar.gz", "/output"]

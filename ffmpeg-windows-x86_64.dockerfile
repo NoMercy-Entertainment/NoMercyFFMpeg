@@ -37,7 +37,7 @@ RUN echo "------------------------------------------------------" \
     && echo "🔧 Installing dependencies" \
     && apt-get install -y --no-install-recommends \
     mingw-w64 mingw-w64-tools mingw-w64-x86-64-dev mingw-w64-common libgit2-dev zip openjdk-11-jdk ant >/dev/null 2>&1 \
-    && apt-get upgrade -y >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
+    && apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean -y >/dev/null 2>&1 && apt-get clean -y >/dev/null 2>&1 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && echo "✅ Installations completed successfully" \
     && echo "------------------------------------------------------"
@@ -173,6 +173,6 @@ RUN chmod +x /scripts/init/package.sh && /scripts/init/package.sh
 
 FROM alpine:latest AS final
 
-COPY --from=windows /output/ffmpeg-8.1.2-windows-x86_64.zip /build/ffmpeg-8.1.2-windows-x86_64.zip
+COPY --from=windows /output/ffmpeg-9.0-windows-x86_64.zip /build/ffmpeg-9.0-windows-x86_64.zip
 
-CMD ["cp", "/build/ffmpeg-8.1.2-windows-x86_64.zip", "/output"]
+CMD ["cp", "/build/ffmpeg-9.0-windows-x86_64.zip", "/output"]

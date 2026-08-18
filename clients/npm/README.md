@@ -70,6 +70,7 @@ Resolution order for each tool:
 | OS | Arch | Release artifact |
 | --- | --- | --- |
 | Windows | x64 | `windows-x86_64.zip` |
+| Windows | arm64 | `windows-aarch64.zip` |
 | Linux | x64 | `linux-x86_64.tar.gz` |
 | Linux | arm64 | `linux-aarch64.tar.gz` |
 | macOS | arm64 | `darwin-arm64.tar.gz` |

@@ -33,7 +33,7 @@ docker compose run --rm ffmpeg-linux-x86_64
 
 ```powershell
 # Smoke-test the produced binary by extracting it from the build stage
-docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -version            # expect "8.1.2"
+docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -version            # expect "9.0"
 docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -hide_banner -muxers   | Select-String "chapters_vtt|spritevtt|vobsub"
 docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -hide_banner -encoders | Select-String "ocr_subtitle"
 docker compose run --rm --entrypoint ffmpeg ffmpeg-linux-x86_64 -hide_banner -filters  | Select-String "beatdetect"
@@ -71,10 +71,12 @@ docker compose run   --rm             ffmpeg-linux-aarch64
 docker compose build --progress=plain ffmpeg-windows-x86_64
 docker compose run   --rm             ffmpeg-windows-x86_64
 
-# ffmpeg-windows-arm64 is currently commented out in docker-compose.yml.
-# Uncomment the service block there before building.
-# docker compose build --progress=plain ffmpeg-windows-arm64
-# docker compose run   --rm             ffmpeg-windows-arm64
+# Windows on ARM. Built and released like the rest, but nothing in CI executes
+# it (no runner can run an ARM64 PE) and there is no machine in the verify
+# fleet, so its release-checklist box only ticks when a human runs
+# tests/tests.ps1 on real hardware. See "Windows on ARM" in README.md.
+docker compose build --progress=plain ffmpeg-windows-aarch64
+docker compose run   --rm             ffmpeg-windows-aarch64
 
 docker compose build --progress=plain ffmpeg-darwin-x86_64
 docker compose run   --rm             ffmpeg-darwin-x86_64

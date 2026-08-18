@@ -22,6 +22,7 @@ export interface PlatformTarget {
 
 const TARGETS: Record<string, PlatformTarget> = {
 	'win32-x64': { slug: 'windows-x86_64', ext: 'zip', ffmpeg: 'ffmpeg.exe', ffprobe: 'ffprobe.exe' },
+	'win32-arm64': { slug: 'windows-aarch64', ext: 'zip', ffmpeg: 'ffmpeg.exe', ffprobe: 'ffprobe.exe' },
 	'linux-x64': { slug: 'linux-x86_64', ext: 'tar.gz', ffmpeg: 'ffmpeg', ffprobe: 'ffprobe' },
 	'linux-arm64': { slug: 'linux-aarch64', ext: 'tar.gz', ffmpeg: 'ffmpeg', ffprobe: 'ffprobe' },
 	'darwin-arm64': { slug: 'darwin-arm64', ext: 'tar.gz', ffmpeg: 'ffmpeg', ffprobe: 'ffprobe' },

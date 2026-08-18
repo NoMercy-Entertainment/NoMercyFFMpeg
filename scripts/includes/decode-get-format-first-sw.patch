@@ -1,0 +1,71 @@
+Upstream: lavc/decode: change sw format selection logic in avcodec_default_get_format()
+Commit:   3befae81f1dc (FFmpeg master, 2026-03-27)
+Fixes:    https://trac.ffmpeg.org/ticket/7965
+
+Backported onto FFmpeg 8.1.2, alongside hevc-alpha-videotoolbox.patch. Like
+that one it landed on master after release/8.1 branched and was never
+backported, so no 8.1.x point release carries it.
+
+Second half of HEVC-with-alpha support. The hevc decoder offers get_format()
+the alpha format first and the base-layer format last. Stock 8.1.2's
+avcodec_default_get_format() returns the LAST software entry, so it always
+picks the base-layer yuv420p and the alpha layer is never decoded -- upstream's
+own commit message says the change "selects YUVA rather than YUV for HEVC with
+alpha".
+
+This is why the ffmpeg CLI already produced alpha without this patch while
+ffprobe did not: ffmpeg CLI installs its own get_format callback that walks the
+list front-to-back, which is exactly the logic this commit moves into the
+default callback. Anything using the default -- ffprobe, and any libavcodec API
+consumer -- needs this patch to decode the alpha layer at all.
+
+Note this changes software format selection for every decoder, not just hevc.
+Upstream made it unconditionally, and it aligns the default callback with the
+CLI's long-standing behaviour, but it is the broadest of the three patches.
+
+diff --git a/libavcodec/decode.c b/libavcodec/decode.c
+--- a/libavcodec/decode.c
++++ b/libavcodec/decode.c
+@@ -987,7 +987,6 @@ int avcodec_decode_subtitle2(AVCodecContext *avctx, AVSubtitle *sub,
+ enum AVPixelFormat avcodec_default_get_format(struct AVCodecContext *avctx,
+                                               const enum AVPixelFormat *fmt)
+ {
+-    const AVPixFmtDescriptor *desc;
+     const AVCodecHWConfig *config;
+     int i, n;
+ 
+@@ -1014,12 +1013,13 @@ enum AVPixelFormat avcodec_default_get_format(struct AVCodecContext *avctx,
+     // No device or other setup, so we have to choose from things which
+     // don't any other external information.
+ 
+-    // If the last element of the list is a software format, choose it
++    // Choose the first software format
+     // (this should be best software format if any exist).
+-    for (n = 0; fmt[n] != AV_PIX_FMT_NONE; n++);
+-    desc = av_pix_fmt_desc_get(fmt[n - 1]);
+-    if (!(desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
+-        return fmt[n - 1];
++    for (n = 0; fmt[n] != AV_PIX_FMT_NONE; n++) {
++        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt[n]);
++        if (!(desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
++            return fmt[n];
++    }
+ 
+     // Finally, traverse the list in order and choose the first entry
+     // with no external dependencies (if there is no hardware configuration
+diff --git a/libavcodec/decode.h b/libavcodec/decode.h
+--- a/libavcodec/decode.h
++++ b/libavcodec/decode.h
+@@ -111,8 +111,10 @@ int ff_set_sar(AVCodecContext *avctx, AVRational sar);
+  * instead of calling get_format() directly.
+  *
+  * The list of pixel formats must contain at least one valid entry, and is
+- * terminated with AV_PIX_FMT_NONE.  If it is possible to decode to software,
+- * the last entry in the list must be the most accurate software format.
++ * terminated with AV_PIX_FMT_NONE. If it is possible to decode to software,
++ * the first entry after the last hwaccel one in the list must be the most
++ * accurate software format, followed by less accurate ones in order of
++ * preference.
+  * If it is not possible to decode to software, AVCodecContext.sw_pix_fmt
+  * must be set before calling this function.
+  */

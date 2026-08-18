@@ -3,7 +3,7 @@ name: CI/CD Pipeline
 # Single source of truth for the FFmpeg version produced by this build.
 # Must track `ffmpeg_version` in ffmpeg-base.dockerfile — bump both together.
 env:
-  FFMPEG_VERSION: "8.1.2"
+  FFMPEG_VERSION: "9.0"
 
 concurrency:
   group: cicd-${{ github.ref }}
@@ -32,9 +32,19 @@ jobs:
       force_rebuild: ${{ inputs.force_rebuild || github.event_name == 'pull_request' }}
 
   # ── Base image (every platform FROMs this) ───────────────────────────────
+  # This repository is public and this workflow runs on pull_request, so the
+  # three jobs below would otherwise be reachable from a fork. GitHub withholds
+  # secrets from fork PRs, but not the runner: an approved fork PR executes its
+  # own code on our hardware. The approval gate is a setting someone can relax
+  # or misclick, so the jobs that touch self-hosted machines say so themselves.
+  # Everything else is unchanged - push, workflow_dispatch and same-repo PRs,
+  # which is what the RC flow uses.
   build-base:
     needs: detect-changes
-    if: needs.detect-changes.outputs.base-changed == 'true'
+    if: |
+      needs.detect-changes.outputs.base-changed == 'true'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     uses: ./.github/workflows/reusable-docker-build.yml
     with:
       dockerfile: ffmpeg-base.dockerfile
@@ -57,6 +67,8 @@ jobs:
       always() && !cancelled()
       && needs.detect-changes.outputs.platforms-to-build != '[]'
       && (needs.build-base.result == 'success' || needs.build-base.result == 'skipped')
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +102,8 @@ jobs:
     if: |
       always() && !cancelled()
       && needs.build-platforms.result == 'success'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, beast-unit]
     steps:
       - name: Log in to DockerHub
@@ -107,6 +121,7 @@ jobs:
             [linux-x86_64]=tar.gz
             [linux-aarch64]=tar.gz
             [windows-x86_64]=zip
+            [windows-aarch64]=zip
             [darwin-x86_64]=tar.gz
             [darwin-arm64]=tar.gz
             [freebsd-x86_64]=tar.gz
@@ -183,16 +198,35 @@ jobs:
       - name: Smoke test (windows)
         if: matrix.kind == 'windows'
         shell: pwsh
-        run: ./tests/smoke.ps1 -Workspace $env:GITHUB_WORKSPACE -ExpectedVersion $env:FFMPEG_VERSION
+        run: ./tests/smoke.ps1 -Workspace $env:GITHUB_WORKSPACE -ExpectedVersion $env:FFMPEG_VERSION -Platform "${{ matrix.platform }}"
 
-  # ── Publish/refresh the Release Candidate prerelease (PR only) ───────────
+  # ── Publish/refresh the Release Candidate prerelease (release PR only) ───
   # Gives contributors version-stamped binaries to test manually on each
   # platform. Deleted+recreated each run so assets and tag always match the
-  # latest PR head. Promoted to a real release on master merge (see release).
+  # latest release-PR head. Promoted to a real release on master merge (see
+  # release).
+  #
+  # Restricted to the dev->master PR. This job deletes and recreates one shared
+  # tag, so without a branch condition the RC belongs to whichever PR into
+  # master finished last. That is not theoretical: a workflow-only PR branched
+  # from master republished v1.0.39-rc over the one dev had published, and for
+  # fourteen hours the advertised release candidate contained none of the
+  # twenty commits it was supposed to be shipping. Nothing caught it, because
+  # the manual suite proves libraries were compiled in rather than that the new
+  # features work, so it passed on the wrong binaries. pr-guards already says
+  # PRs into master come from dev; this says it where the damage happens.
+  #
+  # head_ref is a bare branch name, so the same-repo check is not redundant: a
+  # fork's branch called `dev` satisfies the first condition. It cannot reach
+  # this job today only because export-artifacts is fork-guarded, and inheriting
+  # a guarantee from another job's condition is the kind of coincidence that
+  # stops being true the moment that job is refactored.
   publish-rc:
     needs: [detect-changes, export-artifacts, smoke-test]
     if: |
       github.event_name == 'pull_request'
+      && github.head_ref == 'dev'
+      && github.event.pull_request.head.repo.full_name == github.repository
       && needs.export-artifacts.result == 'success'
       && needs.smoke-test.result == 'success'
     runs-on: ubuntu-latest
@@ -313,12 +347,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify the PR build path is green
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           base='${{ needs.build-base.result }}'
           platforms='${{ needs.build-platforms.result }}'
           export='${{ needs.export-artifacts.result }}'
           smoke='${{ needs.smoke-test.result }}'
           echo "base=$base platforms=$platforms export=$export smoke=$smoke"
+
+          # A fork PR skips the three self-hosted jobs by design, so every check
+          # below would report 'skipped' and read as a broken build. Say what
+          # actually happened instead. This still fails: the PR genuinely was
+          # not built, and a green required check on an unbuilt PR would be a
+          # worse lie than a confusing red one.
+          if [[ -n "$HEAD_REPO" && "$HEAD_REPO" != "${GITHUB_REPOSITORY}" ]]; then
+            echo "❌ Not built: pull requests from forks are not run on this"
+            echo "   repository's self-hosted hardware (head repo: ${HEAD_REPO})."
+            echo "   A maintainer has to push the branch to ${GITHUB_REPOSITORY}"
+            echo "   to get a build."
+            exit 1
+          fi
+
           # On a PR we force a full build, so build-base must succeed.
           if [[ "$base" != "success" ]]; then echo "❌ build-base: $base"; exit 1; fi
           if [[ "$platforms" != "success" ]]; then echo "❌ build-platforms: $platforms"; exit 1; fi
@@ -391,7 +441,7 @@ jobs:
           for f in "downloads/ffmpeg-${FFMPEG_VERSION}-"*; do
             [[ -f "$f" ]] || continue
             base=$(basename "$f")
-            # ffmpeg-8.1.2-linux-x86_64.tar.gz  →  ffmpeg-8.1.2-linux-x86_64-vX.Y.Z.tar.gz
+            # ffmpeg-9.0-linux-x86_64.tar.gz  →  ffmpeg-9.0-linux-x86_64-vX.Y.Z.tar.gz
             stem="${base%.*}"
             # handle .tar.gz two-part extension
             case "$base" in

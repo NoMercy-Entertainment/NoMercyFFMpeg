@@ -62,6 +62,7 @@ typedef struct SpriteVTTContext {
     int frame_w;
     int frame_h;
     enum AVPixelFormat pix_fmt;
+    enum AVColorRange color_range;
     int frame_data_size;   /* total bytes per frame */
 } SpriteVTTContext;
 
@@ -84,6 +85,45 @@ static const AVClass spritevtt_class = {
     .option     = spritevtt_options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
+
+/**
+ * Pick the color range to paint empty grid cells with.
+ *
+ * Neither the swscale context built in the trailer (created without range
+ * hints) nor the image encoders are told the stream's color range — both
+ * infer it from the pixel format alone — so the fill has to be derived the
+ * same way, otherwise the "black" written here does not decode as black.
+ * Formats that are full range by definition therefore win over whatever the
+ * stream claims; for everything else an explicit signal is honored and
+ * limited range is the fallback.
+ */
+static enum AVColorRange spritevtt_fill_range(enum AVPixelFormat pix_fmt,
+                                              enum AVColorRange stream_range)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
+
+    switch (pix_fmt) {
+    /* Full range by name; matches swscale's handle_jpeg() */
+    case AV_PIX_FMT_YUVJ411P:
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_YUVJ422P:
+    case AV_PIX_FMT_YUVJ440P:
+    case AV_PIX_FMT_YUVJ444P:
+        return AVCOL_RANGE_JPEG;
+    default:
+        break;
+    }
+
+    /* Grayscale, with or without alpha, is full range there too */
+    if (desc && desc->nb_components <= 2 &&
+        !(desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL)))
+        return AVCOL_RANGE_JPEG;
+
+    if (stream_range == AVCOL_RANGE_JPEG || stream_range == AVCOL_RANGE_MPEG)
+        return stream_range;
+
+    return AVCOL_RANGE_MPEG;
+}
 
 static void format_vtt_time(char *buf, size_t buf_size, int64_t ms)
 {
@@ -114,9 +154,10 @@ static av_cold int spritevtt_init(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    ctx->frame_w  = st->codecpar->width;
-    ctx->frame_h  = st->codecpar->height;
-    ctx->pix_fmt  = (enum AVPixelFormat)st->codecpar->format;
+    ctx->frame_w     = st->codecpar->width;
+    ctx->frame_h     = st->codecpar->height;
+    ctx->pix_fmt     = (enum AVPixelFormat)st->codecpar->format;
+    ctx->color_range = st->codecpar->color_range;
 
     if (ctx->frame_w <= 0 || ctx->frame_h <= 0) {
         av_log(s, AV_LOG_ERROR,
@@ -287,6 +328,8 @@ static int spritevtt_write_trailer(AVFormatContext *s)
     struct SwsContext *sws = NULL;
     AVIOContext *vtt_pb = NULL;
     char *vtt_path = NULL;
+    const enum AVPixelFormat *sup_fmts = NULL;
+    int nb_sup_fmts = 0;
     int ret = 0;
     int fmt_ok, i, p;
 
@@ -333,15 +376,37 @@ static int spritevtt_write_trailer(AVFormatContext *s)
         goto cleanup;
     }
 
-    /* Zero-fill all planes (black / transparent for empty cells) */
+    /* Paint the whole canvas black up front; the blit below overwrites the
+     * cells that have a frame, and whatever is left over is what the player
+     * shows after the last thumbnail. Zeroing the planes is not enough: zero
+     * is neutral only for RGB, while zeroed YUV chroma is saturated green. */
     {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(ctx->pix_fmt);
-        for (p = 0; p < 4 && canvas->data[p]; p++) {
-            int plane_h = grid_h;
-            /* Only chroma planes (1, 2) are subsampled; luma (0) and alpha (3) are full-size */
-            if (p == 1 || p == 2)
-                plane_h = AV_CEIL_RSHIFT(grid_h, desc->log2_chroma_h);
-            memset(canvas->data[p], 0, (size_t)canvas->linesize[p] * plane_h);
+        ptrdiff_t canvas_linesizes[4];
+
+        for (p = 0; p < 4; p++)
+            canvas_linesizes[p] = canvas->linesize[p];
+
+        ret = av_image_fill_black(canvas->data, canvas_linesizes, ctx->pix_fmt,
+                                  spritevtt_fill_range(ctx->pix_fmt,
+                                                       ctx->color_range),
+                                  grid_w, grid_h);
+        if (ret < 0) {
+            /* Exotic format av_image_fill_black() cannot express black in.
+             * Fall back to zero-fill — wrong color for YUV, but the buffer
+             * from av_frame_get_buffer() is uninitialized otherwise. */
+            av_log(s, AV_LOG_WARNING,
+                   "Could not fill canvas with black for pixel format %s (%s); "
+                   "empty grid cells may show a color cast\n",
+                   av_get_pix_fmt_name(ctx->pix_fmt), av_err2str(ret));
+            for (p = 0; p < 4 && canvas->data[p]; p++) {
+                int plane_h = grid_h;
+                /* Only chroma planes (1, 2) are subsampled; luma (0) and alpha (3) are full-size */
+                if (p == 1 || p == 2)
+                    plane_h = AV_CEIL_RSHIFT(grid_h, desc->log2_chroma_h);
+                memset(canvas->data[p], 0, (size_t)canvas->linesize[p] * plane_h);
+            }
+            ret = 0;
         }
     }
 
@@ -386,12 +451,24 @@ static int spritevtt_write_trailer(AVFormatContext *s)
     enc_ctx->height    = grid_h;
     enc_ctx->time_base = (AVRational){ 1, 1 };
 
-    /* Check if canvas pixel format is supported by the encoder */
+    /* Check if canvas pixel format is supported by the encoder.
+     * AVCodec.pix_fmts was removed in FFmpeg 9; avcodec_get_supported_config()
+     * is the replacement. A NULL list means every pixel format is accepted. */
     fmt_ok = 0;
-    if (enc->pix_fmts) {
-        const enum AVPixelFormat *p_fmt;
-        for (p_fmt = enc->pix_fmts; *p_fmt != AV_PIX_FMT_NONE; p_fmt++) {
-            if (*p_fmt == ctx->pix_fmt) {
+    ret = avcodec_get_supported_config(NULL, enc, AV_CODEC_CONFIG_PIX_FORMAT, 0,
+                                       (const void **)&sup_fmts, &nb_sup_fmts);
+    if (ret < 0) {
+        av_log(s, AV_LOG_ERROR,
+               "Could not query supported pixel formats for %s encoder\n",
+               enc->name);
+        goto cleanup;
+    }
+
+    if (!sup_fmts) {
+        fmt_ok = 1;
+    } else {
+        for (p = 0; p < nb_sup_fmts; p++) {
+            if (sup_fmts[p] == ctx->pix_fmt) {
                 fmt_ok = 1;
                 break;
             }
@@ -402,13 +479,13 @@ static int spritevtt_write_trailer(AVFormatContext *s)
         enc_ctx->pix_fmt = ctx->pix_fmt;
     } else {
         /* Use first supported format and convert with swscale */
-        if (!enc->pix_fmts || enc->pix_fmts[0] == AV_PIX_FMT_NONE) {
+        if (nb_sup_fmts <= 0 || sup_fmts[0] == AV_PIX_FMT_NONE) {
             av_log(s, AV_LOG_ERROR,
                    "Encoder has no supported pixel formats\n");
             ret = AVERROR(EINVAL);
             goto cleanup;
         }
-        enc_ctx->pix_fmt = enc->pix_fmts[0];
+        enc_ctx->pix_fmt = sup_fmts[0];
 
         av_log(s, AV_LOG_INFO,
                "Converting pixel format %s -> %s for %s encoder\n",

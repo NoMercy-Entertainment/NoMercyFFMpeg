@@ -5,6 +5,12 @@ if [[ ${TARGET_OS} == "darwin" || ${TARGET_OS} == "freebsd" ]]; then
     exit 255
 fi
 
+if [[ ${TARGET_OS} == "windows" && ${ARCH} == "aarch64" ]]; then
+    # NVIDIA ships no Windows-on-ARM driver, so there is nothing to talk to,
+    # and the copies below are x86-64 Linux binaries regardless.
+    exit 255
+fi
+
 cp -R /usr/local/cuda/include/* ${PREFIX}/include
 cp -R /usr/local/cuda/lib64/* ${PREFIX}/lib
 

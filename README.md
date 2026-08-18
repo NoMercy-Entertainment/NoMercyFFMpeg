@@ -14,7 +14,7 @@
 
 ## 🎯 Purpose
 
-This repository contains the build infrastructure for creating optimized FFmpeg binaries (currently **FFmpeg 8.1.2**) specifically tailored for the **NoMercy MediaServer** ecosystem. These builds include custom filters, muxers, codecs, and optimizations that enhance media processing capabilities within our platform.
+This repository contains the build infrastructure for creating optimized FFmpeg binaries (currently **FFmpeg 9.0**) specifically tailored for the **NoMercy MediaServer** ecosystem. These builds include custom filters, muxers, codecs, and optimizations that enhance media processing capabilities within our platform.
 
 > **⚠️ Internal Use Only**
 > These FFmpeg builds are specifically configured for NoMercy MediaServer and may not be suitable for general-purpose use. For standard FFmpeg binaries, please visit the [official FFmpeg website](https://ffmpeg.org/).
@@ -30,9 +30,58 @@ Our build system uses a modular Docker-based approach: a shared base image ([ffm
 | **Windows** | x86_64 | ✅ |
 | **macOS** | x86_64, Apple Silicon (ARM64) | ✅ |
 | **FreeBSD** | x86_64 | ✅ |
-| **Windows** | ARM64 | ⚠️ Dockerfile available, not yet in CI |
+| **Windows** | ARM64 (aarch64) | ✅ ⚠️ see below |
 
 Each release ships `ffmpeg`, `ffprobe`, and `ffplay` (where built) as fully static binaries per platform.
+
+### Windows on ARM (windows-aarch64)
+
+Built and released like every other platform, with one difference that matters:
+**no automated test ever executes it.**
+
+It uses a different toolchain from the rest — llvm-mingw (clang/lld) rather than
+GCC, because the GCC cross-compiler for this target crashes on
+`-fstack-protector-strong` and ships a CRT header that does not parse.
+
+Nothing in CI can run an ARM64 Windows binary. `windows-latest` is x64, and
+Windows-on-ARM emulates x64 rather than the reverse, so `tests/smoke.ps1`
+downgrades to validating the PE header (`Machine == 0xAA64`) instead of
+executing — the same treatment `smoke.sh` gives `linux-aarch64` and
+`freebsd-x86_64`. That proves the artifact is a well-formed ARM64 binary
+carrying the expected symbols. It does not prove it decodes a single frame.
+
+There is also no Windows-on-ARM machine in the verify fleet, so `verify-rc.yml`
+produces no verdict for it and `sync-checklist.js` leaves its checklist box
+unticked. **A release PR therefore stays blocked until a human runs
+`tests/tests.ps1` on real hardware and records a verdict.** That is deliberate:
+the box is the only thing standing between an unexecuted binary and a release.
+
+When running it by hand, pass the platform explicitly:
+
+```powershell
+.\tests\tests.ps1 -Workspace <extracted-dir> -Platform windows-aarch64
+```
+
+`-Platform` defaults to `windows-x86_64`, so omitting it produces a verdict
+labelled for the wrong platform — which `sync-checklist.js` will then match
+against the wrong checklist box.
+
+To close the gap, add a runner labelled
+`["self-hosted","ffmpeg-verify","windows-aarch64"]`, then add the matrix entry
+in `.github/workflows/verify-rc.yml` and the name in the `REQUIRED` list in
+`.github/workflows/fleet-health.yml`. Both carry comments pointing back here.
+
+Meanwhile Windows-on-ARM users are not stranded: the `windows-x86_64` build runs
+under Windows' x64 emulation. The native build is a performance improvement.
+
+Capability differences from `windows-x86_64`, all deliberate:
+
+| Component | windows-x86_64 | windows-aarch64 | Why |
+|---|---|---|---|
+| NVENC / CUDA / AMF / QSV | ✅ | ➖ | No NVIDIA, AMD or Intel GPU exists on Windows-on-ARM |
+| OpenBLAS (whisper) | ✅ | ➖ | Builds x86 kernels regardless of `TARGET`; whisper falls back to ggml's own kernels, as on linux/darwin/freebsd |
+| SVT-AV1 dotprod/i8mm | n/a | ➖ | Optional aarch64 extension kernels; baseline NEON is on. Enabling them would raise the hardware floor for every WoA device |
+| Everything else | ✅ | ✅ | x264, x265, AV1, VPx, opus, xavs2, zimg, Vulkan, and all NoMercy filters/muxers |
 
 ### Build Features
 - 🔒 **Security Scanning**: Trivy vulnerability assessment on all platform images
@@ -55,12 +104,14 @@ graph TD
     E --> F[Linux x86_64]
     E --> G[Linux aarch64]
     E --> H[Windows x86_64]
+    E --> H2[Windows ARM64]
     E --> I[macOS x86_64]
     E --> J[macOS ARM64]
     E --> K[FreeBSD x86_64]
     F --> L[Export Artifacts]
     G --> L
     H --> L
+    H2 --> L
     I --> L
     J --> L
     K --> L
@@ -132,7 +183,10 @@ Our custom FFmpeg builds include several features **NOT** available in official 
 | **Chapter VTT muxer** | Muxer | Exports chapter metadata as WebVTT |
 | **VOBsub muxer** | Muxer | Writes DVD-style VOBsub subtitle output |
 | **OmniDrive protocol** | Protocol | Direct I/O against NoMercy OmniDrive storage (Linux/Windows/FreeBSD) |
+| **`dvdread:` protocol** | Protocol | `dvdread://` URI input (byte-stream over libdvdread title VOBs, symmetric with `bluray://`) |
 | **Auto-create directories** | Core patch | Output muxers automatically create missing parent directories |
+| **HEVC alpha layer** | Decoder patch | Decodes the alpha channel of HEVC-with-alpha video from Apple VideoToolbox (single `hvc1` track, two-layer bitstream) instead of silently dropping it. Backports upstream `eedf8f0165fe` + `3befae81f1dc`, neither of which reached 8.1.x, plus a NoMercy change so `ffprobe` reports `yuva420p` at stream level and not just per frame ([ticket #7965](https://trac.ffmpeg.org/ticket/7965)) |
+| **`whisper` language detection** | Filter patch | The `whisper` filter exposes the auto-detected spoken language (`lavfi.whisper.language` + `lavfi.whisper.language_confidence` frame metadata, `detected_language` object in JSON output) |
 | **AACS/BD+ static keydb** | Patch | libaacs/libbluray patched for built-in Blu-ray decryption support |
 
 #### 🤖 **AI & Analysis**
@@ -165,7 +219,7 @@ Our custom FFmpeg builds include several features **NOT** available in official 
 
 #### 📀 **Disc & Container Support**
 - **Blu-ray**: libbluray + libaacs with static keydb patches for decryption
-- **DVD**: libdvdread + libdvdnav, plus the custom VOBsub muxer
+- **DVD**: libdvdread + libdvdnav, plus the custom VOBsub muxer and the `dvdread://` input protocol
 - **CD**: libcdio audio extraction
 - **Streaming**: SRT protocol, OpenSSL TLS
 - **Subtitles**: libass rendering, libzvbi teletext, OCR-based bitmap-to-text conversion

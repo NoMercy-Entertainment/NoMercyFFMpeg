@@ -1,0 +1,114 @@
+name: Fleet Health
+
+# Confirms the RC verification fleet is alive and still has the hardware it is
+# trusted to test.
+#
+# Without this, a runner that died quietly stays invisible until a release is
+# waiting on it, and the failure looks like a broken build rather than a broken
+# machine. Running the capability probe (not just a ping) also catches the worse
+# case: a host that is up but has lost its GPU, which would silently downgrade a
+# hardware check into a skip.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            labels: '["self-hosted","ffmpeg-verify","linux-x86_64"]'
+            shell: bash
+          - name: darwin-arm64
+            labels: '["self-hosted","ffmpeg-verify","darwin-arm64"]'
+            shell: bash
+          - name: windows-x86_64
+            labels: '["self-hosted","ffmpeg-verify","windows-x86_64"]'
+            shell: pwsh
+    runs-on: ${{ fromJSON(matrix.labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Probe capabilities (unix)
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: |
+          echo "### ${{ matrix.name }} — $(uname -srm)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bash tests/lib/capabilities.sh | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Probe capabilities (windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          . ./tests/lib/capabilities.ps1
+          "### ${{ matrix.name }} — $([System.Environment]::OSVersion.VersionString)" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          foreach ($feature in 'nvenc', 'amf', 'vpl', 'videotoolbox') {
+            $line = "{0,-14} {1}" -f $feature, (Hw-Capability -Feature $feature)
+            Write-Host $line
+            $line | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          # This host is the fleet's only NVENC hardware. If it loses the GPU,
+          # the hardware checklist line would quietly downgrade to a skip.
+          if ((Hw-Capability -Feature 'nvenc') -ne 'available') {
+            throw 'NVENC is no longer available on the only host that can verify it.'
+          }
+
+  # Reports which verification targets have no online runner at all. Split from
+  # the probe jobs on purpose: those cannot report a runner that never picked up
+  # a job, because they would simply queue forever.
+  registry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every verification label has an online runner
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN || github.token }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # windows-aarch64 is a released platform but is NOT required here:
+          # no Windows-on-ARM machine is in the fleet, so listing it would
+          # report the fleet permanently unhealthy for a runner nobody has.
+          # Add it here at the same time as the verify-rc.yml matrix entry.
+          REQUIRED="linux-x86_64 linux-aarch64 windows-x86_64 darwin-x86_64 darwin-arm64 freebsd-driver"
+
+          if ! gh api "orgs/${ORG}/actions/runners" --jq '.runners' > runners.json 2>/dev/null; then
+            echo "::warning::Cannot read the org runner list with this token — skipping the registry check."
+            exit 0
+          fi
+
+          missing=0
+          {
+            echo "| Label | Online runner |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for label in $REQUIRED; do
+            name=$(jq -r --arg l "$label" \
+              'map(select(.status == "online" and any(.labels[]; .name == $l))) | .[0].name // ""' \
+              runners.json)
+            if [[ -z "$name" ]]; then
+              echo "| \`${label}\` | ❌ none online |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::No online runner carries the '${label}' label."
+              missing=$((missing + 1))
+            else
+              echo "| \`${label}\` | ✅ ${name} |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          [[ "$missing" -eq 0 ]] || exit 1
+          echo "✅ Every verification target has an online runner."
