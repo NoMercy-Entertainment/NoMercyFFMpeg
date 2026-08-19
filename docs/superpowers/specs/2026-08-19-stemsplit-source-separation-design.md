@@ -216,8 +216,32 @@ separates in a little over two minutes on a 16-thread machine — fine for a med
 server pre-generating karaoke tracks on library scan, and unsuitable for
 real-time playback, exactly as already documented.
 
-Peak resident memory is **141 MiB measured**, against an estimated budget of
-200 MB.
+Peak resident memory, measured on the complete filter: **194 MiB**, rising to
+about **211 MiB** when `overlap` is non-zero. The estimated budget was 200 MB, so
+the default configuration sits just inside it and the overlap path just outside.
+Neither figure is a problem for the target deployment, but the estimate should no
+longer be quoted as a ceiling.
+
+### 4.5 What the reconstruction test does and does not prove
+
+Summing the stems reconstructs the mixture to about **-138 dB**. This is a strong
+result for the signal path and a worthless one for separation quality, and the
+distinction matters enough to record.
+
+The ratio masks sum to exactly 1 by construction in the `passthrough` and
+`average` high-band modes, and the normalised overlap blend preserves that sum
+exactly. So the figure validates the periodic Hann on both ends, the 2/3
+compensation, overlap-add alignment, the ring index arithmetic, reuse of the
+stored complex spectrum, the 4096-sample lead-in crop, and the EOF truncation.
+
+It does **not** validate that the network ran, that the estimated magnitudes are
+what they claim to be, that the two masks are not swapped, or that the separation
+is any good. A build with garbage in the magnitude estimates reconstructs to the
+same -138 dB. A deliberate mask-swap mutation was measured at -138.2 dB.
+
+Separation correctness rests on the per-layer parity of section 9.2, which
+compares both instruments' final sigmoid against the Python reference. Separation
+*quality* rests on listening, which no measurement here substitutes for.
 
 ---
 
