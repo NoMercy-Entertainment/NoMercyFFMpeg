@@ -415,6 +415,13 @@ static int ss_model_load(AVFilterContext *ctx)
     int k, n, i;
     int ret;
 
+    /* Defensive idempotency: no known FFmpeg path calls ss_model_load()
+     * twice on a live context, but if one ever does, s->backend, s->gguf_ctx
+     * and s->instrument_names[] would each be silently overwritten and
+     * leaked rather than freed. Make "a load always starts from a clean
+     * slate" an explicit invariant instead of an implicit assumption. */
+    ss_model_free(s);
+
     /* Bridge ggml's own log output (including gguf_init_from_file's
      * internal warnings, e.g. "invalid magic characters") to av_log at
      * matching severity, before anything below can trigger it. */
@@ -741,6 +748,20 @@ static av_cold void uninit(AVFilterContext *ctx)
     StemSplitContext *s = ctx->priv;
 
     ss_model_free(s);
+
+    /* ggml_log_set() is process-global, not per-context: ss_model_load()
+     * registered cb_log with THIS ctx as its user_data. If we leave that
+     * registration in place, any ggml call anywhere in the process after
+     * this AVFilterContext is freed -- including from an unrelated whisper
+     * filter instance still running in the same filtergraph/process, which
+     * this media server routinely does for subtitles -- invokes cb_log with
+     * a dangling AVFilterContext* and writes through it via av_log(): a
+     * use-after-free. Restore ggml's default sink instead. If another ggml
+     * user (e.g. whisper) is still live, its messages just fall back to
+     * ggml's default logging rather than being routed through freed memory
+     * -- degraded logging beats a crash. Do not remove this. */
+    ggml_log_set(NULL, NULL);
+
     ss_dsp_free(s);
     for (int c = 0; c < SS_CHANNELS; c++) {
         av_freep(&s->pt_window[c]);
