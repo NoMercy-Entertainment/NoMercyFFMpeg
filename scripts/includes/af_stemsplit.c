@@ -25,21 +25,28 @@
  *
  * The filter registers, negotiates 44.1 kHz stereo planar float, and can
  * round-trip audio through STFT analysis/synthesis (passthrough_dsp) or
- * load and validate the model's 100 GGUF tensors (ss_model_load). No ggml
- * compute graph is built yet - that is a later task, built on top of the
- * loaded weights here.
+ * load and validate the model's 100 GGUF tensors (ss_model_load). The
+ * encoder half of the network is built and runs on ggml (ss_build_encoder);
+ * the decoder, the mask and the real per-segment driver are later tasks. For
+ * now the encoder is reachable only through the internal debug_input option,
+ * which injects a spectrogram straight from disk for the per-layer parity
+ * test of design section 9.2.
  */
 
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <ggml.h>
+#include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
 #include <gguf.h>
 
+#include "libavutil/avassert.h"
+#include "libavutil/file_open.h"
 #include "libavutil/opt.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/samplefmt.h"
@@ -363,6 +370,98 @@ static int ss_resolve_layer(AVFilterContext *ctx, struct ggml_context *gctx,
     return 0;
 }
 
+/* ---- Kernel repacking: GGUF axis order -> ggml's convolution axis order --
+ *
+ * gguf-py writes a tensor's numpy shape *reversed* into the file, so
+ * convert.py's (kw, kh, ic, oc) array arrives here as ne = [oc, ic, kh, kw]:
+ * ggml's ne[0], the fastest-varying axis, is the numpy array's *last* axis.
+ * ggml's convolution ops want the exact opposite, ne = [kw, kh, ic, oc], kw
+ * fastest. Probed against the pinned whisper.cpp 1.9.1 ggml before this was
+ * written: a kernel with ne = [KW, KH, IC, OC] convolved against data with
+ * ne = [W, H, IC, N] reproduces a hand-computed reference exactly.
+ * (ggml.h's "// a: [OC, IC, KH, KW]" comments say the same thing written in
+ * reversed, numpy-style order -- they are not a second convention.)
+ *
+ * The correction is a full reversal of all four axes. It is done once, here,
+ * rather than per graph build, and it is applied uniformly to every kernel --
+ * conv*, up* and out -- because it corrects the container's axis convention,
+ * not any one layer's use of it. Leaving up* and out in the on-disk order would
+ * hand the decoder a half-converted model. After the reversal:
+ *
+ *   conv*.weight  [oc,ic,kh,kw] -> [kw,kh,ic,oc]   ggml_conv_2d wants
+ *                                                  ne[2]=IC, ne[3]=OC
+ *   up*.weight    [ic,oc,kh,kw] -> [kw,kh,oc,ic]   ggml_conv_transpose_2d_p0
+ *                                                  wants ne[2]=OC, ne[3]=IC
+ *   out.weight    [2,1,4,4]     -> [4,4,1,2]       ggml_conv_2d again
+ *
+ * conv_weight() in tools/spleeter-gguf/convert.py already swaps TensorFlow's
+ * kh/kw before writing, which is what makes the plain reversal land kh and kw
+ * the right way round here; the two halves only make sense together.
+ *
+ * The tensor is rewritten in place. That is deliberate and it is why
+ * ss_resolve_tensor()'s shape validation runs first, against the on-disk
+ * order: the loader's contract is with the file, this is the adaptation layer
+ * that sits after it. Nothing else reads these tensors in between.
+ */
+static int ss_repack_kernel(struct ggml_tensor *t)
+{
+    const int64_t n0 = t->ne[0], n1 = t->ne[1], n2 = t->ne[2], n3 = t->ne[3];
+    const size_t nb = ggml_nbytes(t);
+    uint16_t *src = t->data;
+    uint16_t *tmp;
+    int64_t i0, i1, i2, i3;
+
+    /* Every .weight is F16 and contiguous; ss_resolve_layer() has already
+     * rejected the model otherwise. The permutation only moves 16-bit units
+     * around, so it needs no float arithmetic and cannot lose precision. */
+    av_assert0(t->type == GGML_TYPE_F16);
+    av_assert0(ggml_is_contiguous(t));
+
+    tmp = av_malloc(nb);
+    if (!tmp)
+        return AVERROR(ENOMEM);
+
+    for (i3 = 0; i3 < n3; i3++)
+        for (i2 = 0; i2 < n2; i2++)
+            for (i1 = 0; i1 < n1; i1++)
+                for (i0 = 0; i0 < n0; i0++)
+                    tmp[i3 + n3 * (i2 + n2 * (i1 + n1 * i0))] =
+                        src[i0 + n0 * (i1 + n1 * (i2 + n2 * i3))];
+
+    memcpy(src, tmp, nb);
+    av_free(tmp);
+
+    t->ne[0] = n3;
+    t->ne[1] = n2;
+    t->ne[2] = n1;
+    t->ne[3] = n0;
+    t->nb[0] = ggml_type_size(t->type);
+    t->nb[1] = t->nb[0] * t->ne[0];
+    t->nb[2] = t->nb[1] * t->ne[1];
+    t->nb[3] = t->nb[2] * t->ne[2];
+
+    return 0;
+}
+
+/* Repacks all 26 kernels (13 layers x 2 instruments) of a loaded model. */
+static int ss_repack_all_kernels(StemSplitContext *s)
+{
+    int k, n, ret;
+
+    for (k = 0; k < s->nb_instruments; k++) {
+        for (n = 0; n < 6; n++) {
+            if ((ret = ss_repack_kernel(s->nets[k].conv[n].w)) < 0)
+                return ret;
+            if ((ret = ss_repack_kernel(s->nets[k].up[n].w)) < 0)
+                return ret;
+        }
+        if ((ret = ss_repack_kernel(s->nets[k].out.w)) < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
 /* Joins s->instrument_names into "a, b" for log/error messages. */
 static void ss_join_instruments(const StemSplitContext *s, char *buf, size_t buf_size)
 {
@@ -537,6 +636,11 @@ static int ss_model_load(AVFilterContext *ctx)
         }
     }
 
+    /* ---- GGUF axis order -> ggml convolution axis order ---- */
+    ret = ss_repack_all_kernels(s);
+    if (ret < 0)
+        goto done;
+
     /* ---- the requested stem must actually be in this model ---- */
     if (s->stem != SS_STEM_ALL) {
         const char *want = s->stem == SS_STEM_VOCALS ? "vocals" : "accompaniment";
@@ -575,6 +679,380 @@ static int ss_model_load(AVFilterContext *ctx)
 
 done:
     gguf_free(gguf);
+    return ret;
+}
+
+/* ---- Encoder graph (Task 7) ---------------------------------------------
+ *
+ * Six blocks of Conv2D 5x5 stride 2 "SAME" + bias, then BatchNorm and
+ * LeakyReLU(0.2) -- except the sixth, which stops after the bias (see
+ * ss_build_encoder). Each block has *two* outputs that both matter, and they
+ * are not interchangeable; ss_encoder_block's contract spells that out.
+ *
+ * Tensor layout throughout is ggml's ne = [F, T, C, N], frequency fastest,
+ * which is also the byte layout the fixtures and ss_dump_tensor use.
+ */
+
+/* Graph-metadata budget for one instrument's encoder. The real graph builds
+ * roughly 15 tensors per block (pad, im2col, two reshapes, mul_mat, reshape,
+ * permute, cont, bias reshape + add, two BatchNorm reshapes + mul + add,
+ * leaky_relu) -- about 90 in total -- so this is a comfortable margin that
+ * still fails loudly rather than silently if the graph grows unexpectedly. */
+#define SS_GRAPH_TENSORS 512
+
+/* TensorFlow's "SAME" padding for kernel 5 / stride 2 is asymmetric: for an
+ * input of N (even), the output is N/2 and the total padding is
+ * (N/2 - 1) * 2 + 5 - N == 3, split as floor(3/2) = 1 before and 2 after, on
+ * each spatial axis. ggml_conv_2d only offers symmetric padding, so the
+ * asymmetry is materialised here with ggml_pad_ext -- which zero-pads each of
+ * the four dimensions independently on the low and high side -- and the
+ * convolution then runs with p0 = p1 = 0. Size check: (N + 1 + 2 - 5)/2 + 1
+ * == N/2.
+ *
+ * Symmetric pad 2 produces the correct output *shape* but shifts every window
+ * by one input sample, which sounds plausible and is wrong. That single
+ * failure is what this task's per-layer parity test exists to catch. Do not
+ * "simplify" this.
+ *
+ * With ne = [F, T, C, N] both ne[0] and ne[1] are spatial; ne[2] (channels)
+ * and ne[3] (batch) are left alone.
+ */
+static struct ggml_tensor *ss_pad_tf(struct ggml_context *g,
+                                     struct ggml_tensor *x,
+                                     int before, int after)
+{
+    return ggml_pad_ext(g, x, before, after, before, after, 0, 0, 0, 0);
+}
+
+/* The converter reduces every BatchNorm to a per-channel affine
+ * y = a*x + b (design 4.3.1, "Note on activation ordering"), so applying it
+ * is a broadcast multiply and add. bn_a/bn_b are 1-D [C]; reshaping them to
+ * [1, 1, C, 1] is what makes ggml repeat them across frequency and time. */
+static struct ggml_tensor *ss_bn(struct ggml_context *g,
+                                 struct ggml_tensor *x,
+                                 const SSLayer *l)
+{
+    struct ggml_tensor *a = ggml_reshape_4d(g, l->bn_a, 1, 1, l->bn_a->ne[0], 1);
+    struct ggml_tensor *b = ggml_reshape_4d(g, l->bn_b, 1, 1, l->bn_b->ne[0], 1);
+
+    return ggml_add(g, ggml_mul(g, x, a), b);
+}
+
+/* pad(1, 2) -> conv 5x5 stride 2 pad 0 -> bias. This is exactly Keras'
+ * Conv2D(..., padding="same") output: Keras folds the bias into the layer's
+ * result, so everything Spleeter calls "conv_n" includes it. */
+static struct ggml_tensor *ss_conv_bias(struct ggml_context *g,
+                                        struct ggml_tensor *x,
+                                        const SSLayer *l)
+{
+    struct ggml_tensor *bias = ggml_reshape_4d(g, l->b, 1, 1, l->b->ne[0], 1);
+
+    x = ss_pad_tf(g, x, 1, 2);
+    x = ggml_conv_2d(g, l->w, x, /*s0*/ 2, /*s1*/ 2, /*p0*/ 0, /*p1*/ 0,
+                     /*d0*/ 1, /*d1*/ 1);
+
+    return ggml_add(g, x, bias);
+}
+
+/* One encoder block, with two outputs.
+ *
+ * Returns the activated tensor -- LeakyReLU(0.2)(BatchNorm(conv)) -- which
+ * feeds the next encoder block. *raw_out receives the post-bias,
+ * pre-BatchNorm convolution output, which feeds the decoder's skip
+ * connection and is what the parity fixtures record.
+ *
+ * Both are needed. Upstream Spleeter concatenates the RAW tensors into the
+ * decoder -- merge1 = [conv5, drop1] ... merge5 = [conv1, batch11] -- and
+ * never the activated rel1..rel5 (design section 4.3.1(a)). A block that
+ * returned only the activated tensor could not wire the skips correctly,
+ * and that is a separation-quality bug, not just a failing fixture.
+ *
+ * "Raw" means after the bias add. Taking the tap before it would be wrong by
+ * a per-channel constant -- exactly the kind of error that survives casual
+ * listening.
+ */
+static struct ggml_tensor *ss_encoder_block(struct ggml_context *g,
+                                            struct ggml_tensor *x,
+                                            const SSLayer *l,
+                                            struct ggml_tensor **raw_out)
+{
+    struct ggml_tensor *raw = ss_conv_bias(g, x, l);
+
+    *raw_out = raw;
+
+    return ggml_leaky_relu(g, ss_bn(g, raw, l), 0.2f, false);
+}
+
+/* Builds all six encoder blocks, filling raw[0..5] with conv1..conv6's raw
+ * (post-bias, pre-BatchNorm) outputs -- the tensors the decoder's skips
+ * consume and the parity fixtures record.
+ *
+ * conv6 is special and stops after the bias. Upstream computes batch6 and a
+ * LeakyReLU of it and then discards both; up1 consumes raw conv6 (design
+ * section 4.3.1(b)). So conv6's BatchNorm is not merely unused here, it is
+ * never built: its bn_a/bn_b are still loaded and shape-validated by
+ * ss_model_load(), because they must exist in the file, and they must never
+ * be applied.
+ */
+static void ss_build_encoder(struct ggml_context *g,
+                             struct ggml_tensor *input,
+                             const SSNet *net,
+                             struct ggml_tensor *raw[6])
+{
+    struct ggml_tensor *x = input;
+    int n;
+
+    av_assert0(input->ne[0] == SS_F);
+    av_assert0(input->ne[1] == SS_T);
+    av_assert0(input->ne[2] == SS_CHANNELS);
+    av_assert0(input->ne[3] == 1);
+
+    for (n = 0; n < 6; n++) {
+        av_assert0(x->ne[2] == ss_conv_io[n][0]);
+
+        if (n == 5)
+            raw[n] = ss_conv_bias(g, x, &net->conv[n]);
+        else
+            x = ss_encoder_block(g, x, &net->conv[n], &raw[n]);
+
+        /* Assert the shape before trusting the values: a shape assertion
+         * that fires is worth ten minutes of debugging a parity mismatch.
+         * Each block halves both spatial axes; the channel count comes from
+         * the model's own (in, out) table rather than a second copy of it.
+         * Expected, in [F, T, C] order: [512,256,16] [256,128,32]
+         * [128,64,64] [64,32,128] [32,16,256] [16,8,512]. */
+        av_assert0(raw[n]->ne[0] == SS_F >> (n + 1));
+        av_assert0(raw[n]->ne[1] == SS_T >> (n + 1));
+        av_assert0(raw[n]->ne[2] == ss_conv_io[n][1]);
+        av_assert0(raw[n]->ne[3] == 1);
+    }
+}
+
+/* Writes one tensor to <dump_dir>/<name>.f32 as raw float32 in ggml's native
+ * order: ne = [F, T, C] with F fastest, i.e. a [C][T][F] byte layout. That is
+ * exactly what tools/spleeter-gguf/compare.py reads back with
+ * np.fromfile(...).reshape(C, T, F), and what dump_reference.py wrote. A
+ * no-op when the internal `dump` option is unset.
+ *
+ * Returns an error rather than the void the brief specified, so a failed
+ * write surfaces as a filter error here instead of as a puzzling "missing
+ * dump file" from the comparator much later.
+ */
+static int ss_dump_tensor(AVFilterContext *ctx, const char *name,
+                          struct ggml_tensor *t)
+{
+    StemSplitContext *s = ctx->priv;
+    const size_t nb = ggml_nbytes(t);
+    char path[1024];
+    void *buf;
+    FILE *f;
+    size_t written;
+
+    if (!s->dump_dir || !*s->dump_dir)
+        return 0;
+
+    av_assert0(t->type == GGML_TYPE_F32);
+    av_assert0(ggml_is_contiguous(t));
+
+    buf = av_malloc(nb);
+    if (!buf)
+        return AVERROR(ENOMEM);
+    ggml_backend_tensor_get(t, buf, 0, nb);
+
+    snprintf(path, sizeof(path), "%s/%s.f32", s->dump_dir, name);
+    f = avpriv_fopen_utf8(path, "wb");
+    if (!f) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Could not open '%s' for writing; does the 'dump' directory "
+               "exist?\n", path);
+        av_free(buf);
+        return AVERROR(EIO);
+    }
+
+    written = fwrite(buf, 1, nb, f);
+    fclose(f);
+    av_free(buf);
+
+    if (written != nb) {
+        av_log(ctx, AV_LOG_ERROR, "Short write to '%s'.\n", path);
+        return AVERROR(EIO);
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE,
+           "stemsplit: dumped %s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+           "to %s\n", name, t->ne[0], t->ne[1], t->ne[2], path);
+
+    return 0;
+}
+
+/* ---- Internal parity path: `debug_input` --------------------------------
+ *
+ * Design section 9.2 compares the network layer by layer against a Python
+ * reference. Those fixtures were computed by
+ * tools/spleeter-gguf/dump_reference.py from a fixed *synthetic* magnitude
+ * spectrogram, not from audio, so the comparison has to inject that exact
+ * tensor: feeding real audio through the STFT would hand the network a
+ * completely different input and fail for a trivial reason. The STFT is
+ * covered separately by Task 5's round-trip test, which is the point -- each
+ * half is tested in isolation.
+ *
+ * The file is [C=2][T=512][F=1024] float32, frequency contiguous, which is
+ * byte-for-byte ggml's ne = [F, T, C, 1], so it is read straight into the
+ * input tensor with no reordering.
+ */
+static int ss_read_debug_input(AVFilterContext *ctx, float **out)
+{
+    StemSplitContext *s = ctx->priv;
+    const size_t want = (size_t) SS_CHANNELS * SS_T * SS_F * sizeof(float);
+    float *buf;
+    FILE *f;
+    long size;
+    int ret = 0;
+
+    *out = NULL;
+
+    f = avpriv_fopen_utf8(s->debug_input_path, "rb");
+    if (!f) {
+        av_log(ctx, AV_LOG_ERROR, "Could not open debug_input file '%s'.\n",
+               s->debug_input_path);
+        return AVERROR(EIO);
+    }
+
+    if (fseek(f, 0, SEEK_END) < 0 || (size = ftell(f)) < 0 ||
+        fseek(f, 0, SEEK_SET) < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Could not size debug_input file '%s'.\n",
+               s->debug_input_path);
+        fclose(f);
+        return AVERROR(EIO);
+    }
+
+    if ((uint64_t) size != (uint64_t) want) {
+        av_log(ctx, AV_LOG_ERROR,
+               "debug_input file '%s' is %ld bytes; expected %zu "
+               "([C=%d][T=%d][F=%d] float32).\n",
+               s->debug_input_path, size, want, SS_CHANNELS, SS_T, SS_F);
+        fclose(f);
+        return AVERROR(EINVAL);
+    }
+
+    buf = av_malloc(want);
+    if (!buf) {
+        fclose(f);
+        return AVERROR(ENOMEM);
+    }
+
+    if (fread(buf, 1, want, f) != want) {
+        av_log(ctx, AV_LOG_ERROR, "Short read from debug_input file '%s'.\n",
+               s->debug_input_path);
+        av_freep(&buf);
+        ret = AVERROR(EIO);
+    }
+
+    fclose(f);
+    *out = buf;
+
+    return ret;
+}
+
+/* Builds, allocates, runs and dumps one instrument's encoder on `data`. */
+static int ss_run_encoder_once(AVFilterContext *ctx, int k, const float *data)
+{
+    StemSplitContext *s = ctx->priv;
+    const size_t input_bytes = (size_t) SS_CHANNELS * SS_T * SS_F * sizeof(float);
+    struct ggml_init_params ip = {
+        .mem_size   = ggml_tensor_overhead() * SS_GRAPH_TENSORS +
+                      ggml_graph_overhead(),
+        .mem_buffer = NULL,
+        /* Metadata only: ggml_gallocr owns the activation memory. */
+        .no_alloc   = true,
+    };
+    struct ggml_context *g;
+    struct ggml_gallocr *galloc = NULL;
+    struct ggml_cgraph *gf;
+    struct ggml_tensor *input, *raw[6];
+    char name[80];
+    int n, ret = 0;
+
+    g = ggml_init(ip);
+    if (!g)
+        return AVERROR(ENOMEM);
+
+    input = ggml_new_tensor_4d(g, GGML_TYPE_F32, SS_F, SS_T, SS_CHANNELS, 1);
+    ggml_set_name(input, "input");
+    ggml_set_input(input);
+    /* Also flagged as an output: ggml_gallocr never recycles the memory of a
+     * tensor flagged output, so the injected values survive the compute and
+     * can be read back afterwards. That is what makes the dumped
+     * <instrument>.input.f32 a genuine record of what the graph consumed
+     * rather than a copy of what we meant to give it. */
+    ggml_set_output(input);
+
+    ss_build_encoder(g, input, &s->nets[k], raw);
+
+    gf = ggml_new_graph(g);
+    for (n = 0; n < 6; n++) {
+        ggml_set_output(raw[n]);
+        ggml_build_forward_expand(gf, raw[n]);
+    }
+
+    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s->backend));
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Could not allocate the stemsplit compute graph.\n");
+        ret = AVERROR(ENOMEM);
+        goto done;
+    }
+
+    /* Only now that gallocr has backed the graph does the input tensor have
+     * a buffer to be written into. */
+    ggml_backend_tensor_set(input, data, 0, input_bytes);
+
+    ggml_backend_cpu_set_n_threads(s->backend, s->nb_threads > 0 ? s->nb_threads
+                                   : FFMAX(1, ff_filter_get_nb_threads(ctx)));
+
+    if (ggml_backend_graph_compute(s->backend, gf) != GGML_STATUS_SUCCESS) {
+        av_log(ctx, AV_LOG_ERROR, "stemsplit: graph computation failed.\n");
+        ret = AVERROR_EXTERNAL;
+        goto done;
+    }
+
+    snprintf(name, sizeof(name), "%s.input", s->instrument_names[k]);
+    ret = ss_dump_tensor(ctx, name, input);
+
+    for (n = 0; ret >= 0 && n < 6; n++) {
+        snprintf(name, sizeof(name), "%s.conv%d", s->instrument_names[k], n + 1);
+        ret = ss_dump_tensor(ctx, name, raw[n]);
+    }
+
+done:
+    ggml_gallocr_free(galloc);
+    ggml_free(g);
+
+    return ret;
+}
+
+/* Runs every instrument's encoder once on the injected spectrogram. */
+static int ss_run_debug_input(AVFilterContext *ctx)
+{
+    StemSplitContext *s = ctx->priv;
+    float *data = NULL;
+    int k, ret;
+
+    ret = ss_read_debug_input(ctx, &data);
+    if (ret < 0)
+        return ret;
+
+    for (k = 0; k < s->nb_instruments; k++) {
+        ret = ss_run_encoder_once(ctx, k, data);
+        if (ret < 0)
+            break;
+        av_log(ctx, AV_LOG_INFO,
+               "stemsplit: debug_input encoder pass complete for '%s'.\n",
+               s->instrument_names[k]);
+    }
+
+    av_freep(&data);
+
     return ret;
 }
 
@@ -719,6 +1197,15 @@ static av_cold int init(AVFilterContext *ctx)
      * path -- see design section 10, row 1. */
     if (!s->passthrough_dsp) {
         ret = ss_model_load(ctx);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* Internal parity path (design section 9.2): when `debug_input` names a
+     * raw spectrogram, run the network on it once here and dump the taps the
+     * fixtures record, bypassing the STFT entirely. */
+    if (!s->passthrough_dsp && s->debug_input_path && *s->debug_input_path) {
+        ret = ss_run_debug_input(ctx);
         if (ret < 0)
             return ret;
     }
