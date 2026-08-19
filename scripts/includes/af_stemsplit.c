@@ -23,17 +23,22 @@
  * Deezer Spleeter 2stems network, run on ggml (the same library statically
  * linked into this binary for the whisper filter, via whisper.pc).
  *
- * This is the Task 4 skeleton: the filter registers, negotiates 44.1 kHz
- * stereo planar float, and passes audio through unchanged. No STFT, no
- * ggml graph, no model loading happens here - later tasks build all of
- * that on top of this scaffold.
+ * The filter registers, negotiates 44.1 kHz stereo planar float, and can
+ * round-trip audio through STFT analysis/synthesis (passthrough_dsp) or
+ * load and validate the model's 100 GGUF tensors (ss_model_load). No ggml
+ * compute graph is built yet - that is a later task, built on top of the
+ * loaded weights here.
  */
 
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <string.h>
 
 #include <ggml.h>
+#include <ggml-backend.h>
+#include <ggml-cpu.h>
+#include <gguf.h>
 
 #include "libavutil/opt.h"
 #include "libavutil/channel_layout.h"
@@ -57,6 +62,35 @@
 
 enum { SS_STEM_VOCALS, SS_STEM_ACCOMPANIMENT, SS_STEM_ALL };
 enum { SS_HB_PASSTHROUGH, SS_HB_ZEROS, SS_HB_AVERAGE };
+
+/* ---- Model tensors (Task 6) ---------------------------------------------
+ *
+ * One SSNet per instrument: six encoder blocks (conv1..conv6), six decoder
+ * blocks (up1..up6), each carrying weight/bias/BatchNorm-affine, plus a
+ * BatchNorm-less output convolution. This mirrors
+ * tools/spleeter-gguf/convert.py's EXPECTED table exactly -- that table is
+ * the authoritative tensor contract, not this comment.
+ *
+ * Ruling 9: every conv[].bn_a/bn_b and up[].bn_a/bn_b is loaded and shape
+ * validated here, including vocals/accompaniment.conv6's, even though the
+ * real Spleeter graph never applies conv6's BatchNorm (up1 consumes raw
+ * conv6 -- design section 4.3.1(b)). That is a Task 7 compute-graph
+ * decision, not a loading-time one: dropping the tensor here would change
+ * the file's tensor count and break the converter's verify() contract.
+ */
+typedef struct SSLayer {
+    struct ggml_tensor *w, *b, *bn_a, *bn_b;
+} SSLayer;
+
+typedef struct SSNet {
+    SSLayer conv[6];
+    SSLayer up[6];
+    SSLayer out;
+} SSNet;
+
+#define SS_MODEL_ARCH     "spleeter-unet-v1"
+#define SS_NB_INSTRUMENTS 2
+#define SS_KERNEL         5
 
 typedef struct StemSplitContext {
     const AVClass *class;
@@ -99,6 +133,26 @@ typedef struct StemSplitContext {
     int64_t  pt_crop_remaining;      /* output samples still to discard (the lead-in) */
     int64_t  pt_total_in;            /* real input samples received so far */
     int64_t  pt_emitted;             /* real (post-crop) output samples emitted so far */
+
+    /* Model loading (Task 6): 100 GGUF tensors resolved by name into two
+     * SSNet structures and validated by dtype and shape. Loading only --
+     * no compute graph is built from these until Tasks 7/8. */
+    struct ggml_context        *gguf_ctx;    /* owns all tensor metadata and data;
+                                               * created by gguf_init_from_file with
+                                               * no_alloc=false, freed in ss_model_free */
+    struct ggml_backend        *backend;     /* CPU backend, set up here for the
+                                               * compute-graph tasks to reuse */
+    struct ggml_backend_buffer *weights_buf; /* unused for now: no_alloc=false already
+                                               * backs every weight tensor with plain
+                                               * host memory inside gguf_ctx, so there is
+                                               * nothing for a backend buffer to own on
+                                               * the CPU-only backend this project ships.
+                                               * Kept so the field exists if a future
+                                               * backend needs it (ss_model_free frees it
+                                               * if ever non-NULL). */
+    SSNet    nets[SS_NB_INSTRUMENTS];
+    int      nb_instruments;
+    char    *instrument_names[SS_NB_INSTRUMENTS];
 
     int      eof;
     int64_t  next_pts;
@@ -193,6 +247,328 @@ static void ss_synthesize(StemSplitContext *s, const AVComplexFloat *in, float *
 
     for (int n = 0; n < SS_FRAME_LENGTH; n++)
         ola[offset + n] += s->window[n] * s->in_buf[n] * SS_WINDOW_COMPENSATION;
+}
+
+/* ---- Model loading (Task 6) ----------------------------------------------
+ *
+ * Resolves the model's 100 GGUF tensors by name into two SSNet structures
+ * (index 0 / 1 = the first / second instrument named by the model's
+ * "stemsplit.instruments" metadata), validating every tensor's dtype and
+ * ne[] against the shapes implied by tools/spleeter-gguf/convert.py's
+ * EXPECTED table. That table -- not this file -- is the authoritative
+ * tensor contract; the shapes below are its ggml-side mirror, confirmed
+ * against the real converted model with a throwaway probe before writing
+ * this validation (GGUF stores a tensor's ggml `ne[]` as its numpy shape
+ * reversed, so EXPECTED's python (5,5,ic,oc) becomes ne=[oc,ic,5,5]).
+ *
+ * This only loads and validates weights; no compute graph is built here.
+ */
+
+/* (in_channels, out_channels) per encoder block conv1..conv6. */
+static const int ss_conv_io[6][2] = {
+    { 2,  16}, { 16,  32}, { 32,  64}, { 64, 128}, {128, 256}, {256, 512}
+};
+/* (in_channels, out_channels) per decoder block up1..up6. */
+static const int ss_up_io[6][2] = {
+    {512, 256}, {512, 128}, {256,  64}, {128,  32}, { 64,  16}, { 32,   1}
+};
+
+static void cb_log(enum ggml_log_level level, const char *text, void *user_data)
+{
+    AVFilterContext *ctx = user_data;
+    int av_log_level = AV_LOG_DEBUG;
+    switch (level) {
+    case GGML_LOG_LEVEL_ERROR:
+        av_log_level = AV_LOG_ERROR;
+        break;
+    case GGML_LOG_LEVEL_WARN:
+        av_log_level = AV_LOG_WARNING;
+        break;
+    }
+    av_log(ctx, av_log_level, "%s", text);
+}
+
+/* Looks up one tensor by name and validates its dtype and shape, naming the
+ * offending tensor in every failure message (design section 10). Returns
+ * NULL on any mismatch; the caller turns that into AVERROR(EINVAL). */
+static struct ggml_tensor *ss_resolve_tensor(AVFilterContext *ctx,
+                                              struct ggml_context *gctx,
+                                              const char *name,
+                                              const int64_t ne[GGML_MAX_DIMS],
+                                              enum ggml_type type)
+{
+    struct ggml_tensor *t = ggml_get_tensor(gctx, name);
+    int i;
+
+    if (!t) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Model is missing required tensor '%s'. The file may be "
+               "truncated or built for a different architecture.\n", name);
+        return NULL;
+    }
+    if (t->type != type) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Tensor '%s' has the wrong data type: expected %s, got %s.\n",
+               name, ggml_type_name(type), ggml_type_name(t->type));
+        return NULL;
+    }
+    for (i = 0; i < GGML_MAX_DIMS; i++) {
+        if (t->ne[i] != ne[i]) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Tensor '%s' has the wrong shape: expected "
+                   "[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "], got "
+                   "[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "].\n",
+                   name, ne[0], ne[1], ne[2], ne[3],
+                   t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+            return NULL;
+        }
+    }
+    return t;
+}
+
+/* Resolves one conv/up/out block's weight, bias and (if has_bn) BatchNorm
+ * affine tensors for one instrument. */
+static int ss_resolve_layer(AVFilterContext *ctx, struct ggml_context *gctx,
+                             const char *inst, const char *layer,
+                             const int64_t w_ne[GGML_MAX_DIMS], int out_ch,
+                             int has_bn, SSLayer *out)
+{
+    char name[80];
+    const int64_t b_ne[GGML_MAX_DIMS] = { out_ch, 1, 1, 1 };
+
+    snprintf(name, sizeof(name), "%s.%s.weight", inst, layer);
+    out->w = ss_resolve_tensor(ctx, gctx, name, w_ne, GGML_TYPE_F16);
+    if (!out->w)
+        return AVERROR(EINVAL);
+
+    snprintf(name, sizeof(name), "%s.%s.bias", inst, layer);
+    out->b = ss_resolve_tensor(ctx, gctx, name, b_ne, GGML_TYPE_F32);
+    if (!out->b)
+        return AVERROR(EINVAL);
+
+    if (has_bn) {
+        snprintf(name, sizeof(name), "%s.%s.bn_a", inst, layer);
+        out->bn_a = ss_resolve_tensor(ctx, gctx, name, b_ne, GGML_TYPE_F32);
+        if (!out->bn_a)
+            return AVERROR(EINVAL);
+
+        snprintf(name, sizeof(name), "%s.%s.bn_b", inst, layer);
+        out->bn_b = ss_resolve_tensor(ctx, gctx, name, b_ne, GGML_TYPE_F32);
+        if (!out->bn_b)
+            return AVERROR(EINVAL);
+    } else {
+        out->bn_a = out->bn_b = NULL;
+    }
+
+    return 0;
+}
+
+/* Joins s->instrument_names into "a, b" for log/error messages. */
+static void ss_join_instruments(const StemSplitContext *s, char *buf, size_t buf_size)
+{
+    size_t off = 0;
+    int i;
+
+    buf[0] = 0;
+    for (i = 0; i < s->nb_instruments; i++) {
+        int len = snprintf(buf + off, buf_size - off, "%s%s",
+                            i ? ", " : "", s->instrument_names[i]);
+        if (len > 0)
+            off += FFMIN((size_t) len, buf_size - off - 1);
+    }
+}
+
+static void ss_model_free(StemSplitContext *s)
+{
+    int i;
+
+    if (s->backend)
+        ggml_backend_free(s->backend);
+    s->backend = NULL;
+
+    if (s->weights_buf)
+        ggml_backend_buffer_free(s->weights_buf);
+    s->weights_buf = NULL;
+
+    if (s->gguf_ctx)
+        ggml_free(s->gguf_ctx);
+    s->gguf_ctx = NULL;
+
+    for (i = 0; i < SS_NB_INSTRUMENTS; i++)
+        av_freep(&s->instrument_names[i]);
+    s->nb_instruments = 0;
+
+    /* Tensor pointers inside s->nets live in gguf_ctx, already freed above;
+     * clear them so a stray use-after-free reads NULL, not garbage. */
+    memset(s->nets, 0, sizeof(s->nets));
+}
+
+static int ss_model_load(AVFilterContext *ctx)
+{
+    StemSplitContext *s = ctx->priv;
+    struct gguf_init_params gp = { .no_alloc = false, .ctx = &s->gguf_ctx };
+    struct gguf_context *gguf = NULL;
+    int64_t key;
+    size_t n_inst;
+    const char *arch;
+    char avail[SS_NB_INSTRUMENTS * 32];
+    int k, n, i;
+    int ret;
+
+    /* Bridge ggml's own log output (including gguf_init_from_file's
+     * internal warnings, e.g. "invalid magic characters") to av_log at
+     * matching severity, before anything below can trigger it. */
+    ggml_log_set(cb_log, ctx);
+
+    if (!s->model_path || !*s->model_path) {
+        av_log(ctx, AV_LOG_ERROR,
+               "No model specified. Use the 'model' option to point at a "
+               "stemsplit .gguf file.\n");
+        return AVERROR(EINVAL);
+    }
+
+    gguf = gguf_init_from_file(s->model_path, gp);
+    if (!gguf) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Could not read model '%s': not a valid GGUF file, or the "
+               "file is missing or unreadable. Download it from the "
+               "releases page of this repository "
+               "(spleeter-2stems-f16.gguf, "
+               "https://github.com/NoMercy-Entertainment/nomercy-ffmpeg/releases).\n",
+               s->model_path);
+        return AVERROR(EIO);
+    }
+
+    /* ---- architecture tag: refuse to guess ---- */
+    key = gguf_find_key(gguf, "stemsplit.arch");
+    if (key < 0) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Model '%s' has no 'stemsplit.arch' tag; expected '%s'. "
+               "Refusing to guess.\n", s->model_path, SS_MODEL_ARCH);
+        ret = AVERROR(EINVAL);
+        goto done;
+    }
+    if (gguf_get_kv_type(gguf, key) != GGUF_TYPE_STRING) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Model '%s' has a malformed 'stemsplit.arch' tag (not a "
+               "string); expected '%s'. Refusing to guess.\n",
+               s->model_path, SS_MODEL_ARCH);
+        ret = AVERROR(EINVAL);
+        goto done;
+    }
+    arch = gguf_get_val_str(gguf, key);
+    if (strcmp(arch, SS_MODEL_ARCH)) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Model '%s' has unrecognised architecture '%s'; expected "
+               "'%s'. Refusing to guess.\n", s->model_path, arch, SS_MODEL_ARCH);
+        ret = AVERROR(EINVAL);
+        goto done;
+    }
+
+    /* ---- instrument list ---- */
+    key = gguf_find_key(gguf, "stemsplit.instruments");
+    if (key < 0 || gguf_get_kv_type(gguf, key) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(gguf, key) != GGUF_TYPE_STRING) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Model '%s' is missing a valid 'stemsplit.instruments' "
+               "string array in its metadata.\n", s->model_path);
+        ret = AVERROR(EINVAL);
+        goto done;
+    }
+    n_inst = gguf_get_arr_n(gguf, key);
+    if (n_inst != SS_NB_INSTRUMENTS) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Model '%s' declares %zu instrument(s); architecture '%s' "
+               "requires exactly %d. Refusing to guess.\n",
+               s->model_path, n_inst, SS_MODEL_ARCH, SS_NB_INSTRUMENTS);
+        ret = AVERROR(EINVAL);
+        goto done;
+    }
+    for (i = 0; i < SS_NB_INSTRUMENTS; i++) {
+        s->instrument_names[i] = av_strdup(gguf_get_arr_str(gguf, key, i));
+        if (!s->instrument_names[i]) {
+            ret = AVERROR(ENOMEM);
+            goto done;
+        }
+    }
+    s->nb_instruments = SS_NB_INSTRUMENTS;
+
+    /* ---- 100 tensors: conv1..conv6, up1..up6, out, per instrument ---- */
+    for (k = 0; k < SS_NB_INSTRUMENTS; k++) {
+        const char *inst = s->instrument_names[k];
+
+        for (n = 0; n < 6; n++) {
+            char layer[16];
+            const int64_t w_ne[GGML_MAX_DIMS] = {
+                ss_conv_io[n][1], ss_conv_io[n][0], SS_KERNEL, SS_KERNEL
+            };
+            snprintf(layer, sizeof(layer), "conv%d", n + 1);
+            ret = ss_resolve_layer(ctx, s->gguf_ctx, inst, layer, w_ne,
+                                    ss_conv_io[n][1], 1, &s->nets[k].conv[n]);
+            if (ret < 0)
+                goto done;
+        }
+
+        for (n = 0; n < 6; n++) {
+            char layer[16];
+            const int64_t w_ne[GGML_MAX_DIMS] = {
+                ss_up_io[n][0], ss_up_io[n][1], SS_KERNEL, SS_KERNEL
+            };
+            snprintf(layer, sizeof(layer), "up%d", n + 1);
+            ret = ss_resolve_layer(ctx, s->gguf_ctx, inst, layer, w_ne,
+                                    ss_up_io[n][1], 1, &s->nets[k].up[n]);
+            if (ret < 0)
+                goto done;
+        }
+
+        {
+            const int64_t w_ne[GGML_MAX_DIMS] = { 2, 1, 4, 4 };
+            ret = ss_resolve_layer(ctx, s->gguf_ctx, inst, "out", w_ne, 2, 0,
+                                    &s->nets[k].out);
+            if (ret < 0)
+                goto done;
+        }
+    }
+
+    /* ---- the requested stem must actually be in this model ---- */
+    if (s->stem != SS_STEM_ALL) {
+        const char *want = s->stem == SS_STEM_VOCALS ? "vocals" : "accompaniment";
+        int found = 0;
+
+        for (i = 0; i < s->nb_instruments; i++) {
+            if (!strcmp(s->instrument_names[i], want)) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            ss_join_instruments(s, avail, sizeof(avail));
+            av_log(ctx, AV_LOG_ERROR,
+                   "Requested stem '%s' is not provided by model '%s'. "
+                   "Available stems: %s.\n", want, s->model_path, avail);
+            ret = AVERROR(EINVAL);
+            goto done;
+        }
+    }
+
+    /* ---- backend: CPU only (design non-goal: no GPU backends) ---- */
+    s->backend = ggml_backend_cpu_init();
+    if (!s->backend) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Could not initialize the ggml CPU backend.\n");
+        ret = AVERROR(ENOMEM);
+        goto done;
+    }
+
+    ss_join_instruments(s, avail, sizeof(avail));
+    av_log(ctx, AV_LOG_INFO,
+           "stemsplit: model '%s' loaded (100 tensors); instruments: %s.\n",
+           s->model_path, avail);
+    ret = 0;
+
+done:
+    gguf_free(gguf);
+    return ret;
 }
 
 /* ---- Minimal round-trip driver for `passthrough_dsp` -------------------
@@ -330,9 +706,14 @@ static av_cold int init(AVFilterContext *ctx)
     StemSplitContext *s = ctx->priv;
     int ret;
 
-    if (!s->model_path || !s->model_path[0]) {
-        av_log(ctx, AV_LOG_ERROR, "No model path specified. Use the 'model' option.\n");
-        return AVERROR(EINVAL);
+    /* Ruling 2: model loading is skippable so passthrough_dsp's round-trip
+     * test (Task 5) keeps working with no model at all. ss_model_load()
+     * does its own "no model given" check for the real (non-passthrough)
+     * path -- see design section 10, row 1. */
+    if (!s->passthrough_dsp) {
+        ret = ss_model_load(ctx);
+        if (ret < 0)
+            return ret;
     }
 
     s->next_pts = AV_NOPTS_VALUE;
@@ -359,6 +740,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 {
     StemSplitContext *s = ctx->priv;
 
+    ss_model_free(s);
     ss_dsp_free(s);
     for (int c = 0; c < SS_CHANNELS; c++) {
         av_freep(&s->pt_window[c]);
