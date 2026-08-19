@@ -388,11 +388,12 @@ static int ss_resolve_layer(AVFilterContext *ctx, struct ggml_context *gctx,
  * not any one layer's use of it. Leaving up* and out in the on-disk order would
  * hand the decoder a half-converted model. After the reversal:
  *
- *   conv*.weight  [oc,ic,kh,kw] -> [kw,kh,ic,oc]   ggml_conv_2d wants
+ *   conv*.weight  [oc,ic,kh,kw] -> [kw,kh,ic,oc]   ggml_conv_2d_direct wants
  *                                                  ne[2]=IC, ne[3]=OC
  *   up*.weight    [ic,oc,kh,kw] -> [kw,kh,oc,ic]   ggml_conv_transpose_2d_p0
  *                                                  wants ne[2]=OC, ne[3]=IC
- *   out.weight    [2,1,4,4]     -> [4,4,1,2]       ggml_conv_2d again
+ *   out.weight    [2,1,4,4]     -> [4,4,1,2]       the output conv, same
+ *                                                  [KW,KH,IC,OC] convention
  *
  * conv_weight() in tools/spleeter-gguf/convert.py already swaps TensorFlow's
  * kh/kw before writing, which is what makes the plain reversal land kh and kw
@@ -693,21 +694,21 @@ done:
  * which is also the byte layout the fixtures and ss_dump_tensor use.
  */
 
-/* Graph-metadata budget for one instrument's encoder. The real graph builds
- * roughly 15 tensors per block (pad, im2col, two reshapes, mul_mat, reshape,
- * permute, cont, bias reshape + add, two BatchNorm reshapes + mul + add,
- * leaky_relu) -- about 90 in total -- so this is a comfortable margin that
- * still fails loudly rather than silently if the graph grows unexpectedly. */
+/* Graph-metadata budget for one instrument's encoder. Each block builds about
+ * ten tensors (pad, kernel cast, conv, bias reshape + add, two BatchNorm
+ * reshapes + mul + add, leaky_relu) -- roughly 60 in total -- so this is a
+ * comfortable margin that still fails loudly rather than silently if the graph
+ * grows unexpectedly. */
 #define SS_GRAPH_TENSORS 512
 
 /* TensorFlow's "SAME" padding for kernel 5 / stride 2 is asymmetric: for an
  * input of N (even), the output is N/2 and the total padding is
  * (N/2 - 1) * 2 + 5 - N == 3, split as floor(3/2) = 1 before and 2 after, on
- * each spatial axis. ggml_conv_2d only offers symmetric padding, so the
- * asymmetry is materialised here with ggml_pad_ext -- which zero-pads each of
- * the four dimensions independently on the low and high side -- and the
- * convolution then runs with p0 = p1 = 0. Size check: (N + 1 + 2 - 5)/2 + 1
- * == N/2.
+ * each spatial axis. ggml's convolution ops take a single p0/p1 per axis and
+ * so can only pad symmetrically, so the asymmetry is materialised here with
+ * ggml_pad_ext -- which zero-pads each of the four dimensions independently on
+ * the low and high side -- and the convolution then runs with p0 = p1 = 0.
+ * Size check: (N + 1 + 2 - 5)/2 + 1 == N/2.
  *
  * Symmetric pad 2 produces the correct output *shape* but shifts every window
  * by one input sample, which sounds plausible and is wrong. That single
@@ -740,16 +741,32 @@ static struct ggml_tensor *ss_bn(struct ggml_context *g,
 
 /* pad(1, 2) -> conv 5x5 stride 2 pad 0 -> bias. This is exactly Keras'
  * Conv2D(..., padding="same") output: Keras folds the bias into the layer's
- * result, so everything Spleeter calls "conv_n" includes it. */
+ * result, so everything Spleeter calls "conv_n" includes it.
+ *
+ * Ruling 16: this uses ggml_conv_2d_direct with the kernel cast to F32, not
+ * ggml_conv_2d. ggml_conv_2d lowers to im2col with dst_type = GGML_TYPE_F16,
+ * so it rounds the *activations* to half precision as well as using the
+ * model's F16 weights. That second rounding is a property of the op, not of
+ * the artifact, and it is what stopped per-layer parity: measured against the
+ * reference, ggml_conv_2d gives 0/12 layers at rtol 1e-3 while this form gives
+ * 12/12. It is also 11% faster and 5 MiB lighter, because conv_2d_direct never
+ * materialises the ~26 MiB F16 im2col buffer -- here the accurate path is also
+ * the cheap one.
+ *
+ * The model on disk is untouched: it is still F16 (spleeter-2stems-f16.gguf,
+ * 39,319,552 bytes) and ggml_cast is a runtime graph node. Do not "optimise"
+ * this back to ggml_conv_2d; design section 9.2's parity test will catch it,
+ * which is the point of that test. */
 static struct ggml_tensor *ss_conv_bias(struct ggml_context *g,
                                         struct ggml_tensor *x,
                                         const SSLayer *l)
 {
     struct ggml_tensor *bias = ggml_reshape_4d(g, l->b, 1, 1, l->b->ne[0], 1);
+    struct ggml_tensor *w    = ggml_cast(g, l->w, GGML_TYPE_F32);
 
     x = ss_pad_tf(g, x, 1, 2);
-    x = ggml_conv_2d(g, l->w, x, /*s0*/ 2, /*s1*/ 2, /*p0*/ 0, /*p1*/ 0,
-                     /*d0*/ 1, /*d1*/ 1);
+    x = ggml_conv_2d_direct(g, w, x, /*s0*/ 2, /*s1*/ 2, /*p0*/ 0, /*p1*/ 0,
+                            /*d0*/ 1, /*d1*/ 1);
 
     return ggml_add(g, x, bias);
 }
