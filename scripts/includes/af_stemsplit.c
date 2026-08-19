@@ -25,12 +25,14 @@
  *
  * The filter registers, negotiates 44.1 kHz stereo planar float, and can
  * round-trip audio through STFT analysis/synthesis (passthrough_dsp) or
- * load and validate the model's 100 GGUF tensors (ss_model_load). The
- * encoder half of the network is built and runs on ggml (ss_build_encoder);
- * the decoder, the mask and the real per-segment driver are later tasks. For
- * now the encoder is reachable only through the internal debug_input option,
- * which injects a spectrogram straight from disk for the per-layer parity
- * test of design section 9.2.
+ * load and validate the model's 100 GGUF tensors (ss_model_load). The whole
+ * network is built and runs on ggml -- ss_build_encoder, ss_build_decoder and
+ * ss_infer -- producing each instrument's estimated magnitude spectrogram.
+ * The real per-segment driver, which turns those estimates into a ratio mask
+ * and writes stems to output pads, is a later task. For now ss_infer is
+ * reachable only through the internal debug_input option, which injects a
+ * spectrogram straight from disk for the per-layer parity test of design
+ * section 9.2.
  */
 
 #include <inttypes.h>
@@ -694,11 +696,13 @@ done:
  * which is also the byte layout the fixtures and ss_dump_tensor use.
  */
 
-/* Graph-metadata budget for one instrument's encoder. Each block builds about
- * ten tensors (pad, kernel cast, conv, bias reshape + add, two BatchNorm
- * reshapes + mul + add, leaky_relu) -- roughly 60 in total -- so this is a
- * comfortable margin that still fails loudly rather than silently if the graph
- * grows unexpectedly. */
+/* Graph-metadata budget for one instrument's full forward pass. An encoder
+ * block builds about ten tensors (pad, kernel cast, conv, bias reshape + add,
+ * two BatchNorm reshapes + mul + add, leaky_relu) and a decoder block about
+ * twelve (kernel cast, transposed conv, crop view + cont, bias reshape + add,
+ * relu, two BatchNorm reshapes + mul + add, concat), with six more for the
+ * output layer -- roughly 140 in total. The margin is deliberate; this is a
+ * tripwire that fails loudly rather than a target. */
 #define SS_GRAPH_TENSORS 512
 
 /* TensorFlow's "SAME" padding for kernel 5 / stride 2 is asymmetric: for an
@@ -845,6 +849,179 @@ static void ss_build_encoder(struct ggml_context *g,
     }
 }
 
+/* ---- Decoder graph (Task 8) ---------------------------------------------
+ *
+ * Six blocks of Conv2DTranspose 5x5 stride 2 "SAME" + bias, then ReLU,
+ * BatchNorm and a concatenation with the matching *raw* encoder tensor,
+ * followed by the dilated output convolution and the sigmoid mask.
+ *
+ * Two asymmetries with the encoder are real and must not be tidied away:
+ *
+ *  - The decoder activates BEFORE normalising (convT -> ReLU -> BatchNorm),
+ *    where the encoder normalises first (conv -> BatchNorm -> LeakyReLU).
+ *    That is why the converter cannot fold BatchNorm into the convolution and
+ *    exports every one of them as a standalone per-channel affine instead
+ *    (design 4.3.1, "Note on activation ordering").
+ *  - Where the encoder pads before convolving, the decoder crops after: see
+ *    ss_crop2d.
+ *
+ * Layout is ggml's ne = [F, T, C, N] throughout, as in the encoder.
+ */
+
+/* The decoder's half of TensorFlow's asymmetric "SAME".
+ *
+ * ggml_conv_transpose_2d_p0 does no padding at all, so a stride-2 kernel-5
+ * transpose of an N-wide input emits (N - 1) * 2 + 5 == 2N + 3 columns.
+ * TensorFlow's Conv2DTranspose with padding="same" emits 2N. The three extra
+ * columns are exactly the ones the forward convolution's padding introduced,
+ * and they come off the same sides: the forward pass padded 1 before and 2
+ * after (ss_pad_tf), so the transpose drops 1 from the front and 2 from the
+ * back, on both spatial axes. That lands the result back on the very grid the
+ * encoder sampled, which is what makes the skip concatenation meaningful.
+ *
+ * Cropping symmetrically -- or 2 from the front and 1 from the back -- gives
+ * the same output *shape* and shifts the whole feature map by one sample,
+ * the decoder's equivalent of the encoder's symmetric-padding trap. Design
+ * section 9.2's per-layer parity test is what catches it.
+ *
+ * The view is not contiguous (it keeps the parent's row stride), and the next
+ * convolution requires contiguous input, hence the ggml_cont. `off` is applied
+ * to ne[0] and ne[1] only; channels and batch are taken whole.
+ */
+static struct ggml_tensor *ss_crop2d(struct ggml_context *g,
+                                     struct ggml_tensor *x,
+                                     int off, int n0, int n1)
+{
+    struct ggml_tensor *v;
+
+    av_assert0(off >= 0 && n0 > 0 && n1 > 0);
+    av_assert0(off + n0 <= x->ne[0] && off + n1 <= x->ne[1]);
+
+    v = ggml_view_4d(g, x, n0, n1, x->ne[2], x->ne[3],
+                     x->nb[1], x->nb[2], x->nb[3],
+                     (size_t) off * x->nb[0] + (size_t) off * x->nb[1]);
+
+    return ggml_cont(g, v);
+}
+
+/* One decoder block.
+ *
+ * Returns the tensor that feeds the next block -- the concatenation of the
+ * skip tensor and this block's output, or just this block's output when
+ * `skip` is NULL (up6, which has no matching encoder layer). *tap_out
+ * receives the pre-concatenation tensor, which is what design section 9.2's
+ * fixtures record for up1..up6; the extra out-parameter mirrors
+ * ss_encoder_block, which needs one for the same reason.
+ *
+ * Concat order is [skip, x] -- the encoder tensor FIRST. Upstream Spleeter
+ * writes Concatenate(axis=-1)([conv5, drop1]) and so on, and axis=-1 is the
+ * channel axis, which is ggml's ne[2] here. Reversing the two operands would
+ * silently permute the next convolution's input channels: no shape changes,
+ * no error is raised, and the output is wrong everywhere.
+ *
+ * Ruling 16's F32 kernel cast applies here too, and it matters more than it
+ * did in the encoder. Handed an F16 kernel, ggml_conv_transpose_2d_p0 rounds
+ * the input activations to F16 as well and lands about 2e-4 relative away
+ * from a double-precision reference; handed an F32 kernel it computes in F32
+ * throughout and lands at 6.5e-8. Both figures were measured against the
+ * pinned ggml before this code was written, along with a check that its
+ * work-buffer sizing is type-aware (4245760 bytes for an F32 kernel where an
+ * F16 one gets 2123008), so the F32 path is a real path and not an overflow
+ * waiting to happen. Six of these layers compound, so do not revert the cast.
+ */
+static struct ggml_tensor *ss_decoder_block(struct ggml_context *g,
+                                            struct ggml_tensor *x,
+                                            struct ggml_tensor *skip,
+                                            const SSLayer *l,
+                                            struct ggml_tensor **tap_out)
+{
+    struct ggml_tensor *bias = ggml_reshape_4d(g, l->b, 1, 1, l->b->ne[0], 1);
+    struct ggml_tensor *w    = ggml_cast(g, l->w, GGML_TYPE_F32);
+
+    x = ggml_conv_transpose_2d_p0(g, w, x, /*stride*/ 2);
+    x = ss_crop2d(g, x, /*off*/ 1, (int) (x->ne[0] - 3), (int) (x->ne[1] - 3));
+    x = ggml_add(g, x, bias);
+    x = ggml_relu(g, x);        /* the decoder activates BEFORE normalising */
+    x = ss_bn(g, x, l);
+
+    *tap_out = x;
+
+    return skip ? ggml_concat(g, skip, x, /*dim*/ 2) : x;
+}
+
+/* Builds the six decoder blocks and the output layer.
+ *
+ * up[0..5] receive each block's pre-concatenation output, the tensors the
+ * parity fixtures record. *mask_out receives the sigmoid output of the final
+ * convolution -- also a fixture tap, named "out" -- and *est_out receives
+ * that mask multiplied by the network input, which is this instrument's
+ * estimated magnitude spectrogram.
+ *
+ * up1 is fed raw conv6, not an activated tensor: upstream computes conv6's
+ * BatchNorm and LeakyReLU and discards both (design 4.3.1(b)), which is why
+ * ss_build_encoder stops the sixth block after its bias.
+ *
+ * The output convolution is kernel 4 with dilation 2, so its effective width
+ * is (4 - 1) * 2 + 1 == 7 and "SAME" needs 6 columns of padding split evenly,
+ * 3 each side. That one is symmetric, so ggml's own p0/p1 expresses it and no
+ * ss_pad_tf/ss_crop2d dance is needed. Size check: 1024 + 6 - 6 == 1024.
+ */
+static void ss_build_decoder(struct ggml_context *g,
+                             struct ggml_tensor *input,
+                             struct ggml_tensor *const raw[6],
+                             const SSNet *net,
+                             struct ggml_tensor *up[6],
+                             struct ggml_tensor **mask_out,
+                             struct ggml_tensor **est_out)
+{
+    /* up1..up5 concatenate with raw conv5..conv1; up6 has no skip. */
+    static const int skip_for[6] = { 4, 3, 2, 1, 0, -1 };
+    struct ggml_tensor *x = raw[5];
+    struct ggml_tensor *bias, *w;
+    int n;
+
+    for (n = 0; n < 6; n++) {
+        av_assert0(x->ne[2] == ss_up_io[n][0]);
+
+        x = ss_decoder_block(g, x,
+                             skip_for[n] >= 0 ? raw[skip_for[n]] : NULL,
+                             &net->up[n], &up[n]);
+
+        /* Each block doubles both spatial axes, so up_n is the mirror of
+         * conv_{6-n}. Expected, in [F, T, C] order: [32,16,256] [64,32,128]
+         * [128,64,64] [256,128,32] [512,256,16] [1024,512,1]. Asserted before
+         * the values are trusted, exactly as in ss_build_encoder. */
+        av_assert0(up[n]->ne[0] == SS_F >> (5 - n));
+        av_assert0(up[n]->ne[1] == SS_T >> (5 - n));
+        av_assert0(up[n]->ne[2] == ss_up_io[n][1]);
+        av_assert0(up[n]->ne[3] == 1);
+    }
+
+    av_assert0(x == up[5] && x->ne[2] == 1);
+
+    bias = ggml_reshape_4d(g, net->out.b, 1, 1, net->out.b->ne[0], 1);
+    w    = ggml_cast(g, net->out.w, GGML_TYPE_F32);
+
+    x = ggml_conv_2d_direct(g, w, x, /*s0*/ 1, /*s1*/ 1, /*p0*/ 3, /*p1*/ 3,
+                            /*d0*/ 2, /*d1*/ 2);
+    x = ggml_add(g, x, bias);
+    x = ggml_sigmoid(g, x);
+
+    av_assert0(x->ne[0] == SS_F);
+    av_assert0(x->ne[1] == SS_T);
+    av_assert0(x->ne[2] == SS_CHANNELS);
+    av_assert0(x->ne[3] == 1);
+
+    *mask_out = x;
+
+    /* The mask times the input is this instrument's estimated magnitude, and
+     * that is where this task stops. Turning the per-instrument estimates
+     * into the ratio mask that actually gets applied to the mixture spectrum
+     * needs every instrument at once and belongs to the segment driver
+     * (design section 4.2); nothing here may anticipate it. */
+    *est_out = ggml_mul(g, x, input);
+}
+
 /* Writes one tensor to <dump_dir>/<name>.f32 as raw float32 in ggml's native
  * order: ne = [F, T, C] with F fastest, i.e. a [C][T][F] byte layout. That is
  * exactly what tools/spleeter-gguf/compare.py reads back with
@@ -971,8 +1148,16 @@ static int ss_read_debug_input(AVFilterContext *ctx, float **out)
     return ret;
 }
 
-/* Builds, allocates, runs and dumps one instrument's encoder on `data`. */
-static int ss_run_encoder_once(AVFilterContext *ctx, int k, const float *data)
+/* Builds, allocates and runs one instrument's full network on `mag`, dumping
+ * every parity tap along the way.
+ *
+ * `est`, when non-NULL, receives this instrument's estimated magnitude
+ * spectrogram -- the sigmoid mask multiplied by `mag` -- in the same
+ * [C][T][F] float32 layout `mag` uses, which is ggml's ne = [F, T, C, 1] byte
+ * for byte, so it is a straight copy out of the graph with no reordering.
+ */
+static int ss_run_network_once(AVFilterContext *ctx, int k, const float *mag,
+                               float *est)
 {
     StemSplitContext *s = ctx->priv;
     const size_t input_bytes = (size_t) SS_CHANNELS * SS_T * SS_F * sizeof(float);
@@ -986,7 +1171,7 @@ static int ss_run_encoder_once(AVFilterContext *ctx, int k, const float *data)
     struct ggml_context *g;
     struct ggml_gallocr *galloc = NULL;
     struct ggml_cgraph *gf;
-    struct ggml_tensor *input, *raw[6];
+    struct ggml_tensor *input, *raw[6], *up[6], *mask, *est_t;
     char name[80];
     int n, ret = 0;
 
@@ -1005,12 +1190,25 @@ static int ss_run_encoder_once(AVFilterContext *ctx, int k, const float *data)
     ggml_set_output(input);
 
     ss_build_encoder(g, input, &s->nets[k], raw);
+    ss_build_decoder(g, input, raw, &s->nets[k], up, &mask, &est_t);
 
     gf = ggml_new_graph(g);
+    /* Expanding est_t pulls in the whole graph; the taps are flagged as
+     * outputs and expanded individually so ggml_gallocr cannot recycle their
+     * memory once their last consumer has run, which would leave the dumps
+     * reading whatever the allocator reused the block for. */
     for (n = 0; n < 6; n++) {
         ggml_set_output(raw[n]);
         ggml_build_forward_expand(gf, raw[n]);
     }
+    for (n = 0; n < 6; n++) {
+        ggml_set_output(up[n]);
+        ggml_build_forward_expand(gf, up[n]);
+    }
+    ggml_set_output(mask);
+    ggml_build_forward_expand(gf, mask);
+    ggml_set_output(est_t);
+    ggml_build_forward_expand(gf, est_t);
 
     galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s->backend));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
@@ -1022,7 +1220,7 @@ static int ss_run_encoder_once(AVFilterContext *ctx, int k, const float *data)
 
     /* Only now that gallocr has backed the graph does the input tensor have
      * a buffer to be written into. */
-    ggml_backend_tensor_set(input, data, 0, input_bytes);
+    ggml_backend_tensor_set(input, mag, 0, input_bytes);
 
     ggml_backend_cpu_set_n_threads(s->backend, s->nb_threads > 0 ? s->nb_threads
                                    : FFMAX(1, ff_filter_get_nb_threads(ctx)));
@@ -1033,12 +1231,36 @@ static int ss_run_encoder_once(AVFilterContext *ctx, int k, const float *data)
         goto done;
     }
 
+    if (est) {
+        av_assert0(ggml_nbytes(est_t) == input_bytes);
+        ggml_backend_tensor_get(est_t, est, 0, input_bytes);
+    }
+
     snprintf(name, sizeof(name), "%s.input", s->instrument_names[k]);
     ret = ss_dump_tensor(ctx, name, input);
 
     for (n = 0; ret >= 0 && n < 6; n++) {
         snprintf(name, sizeof(name), "%s.conv%d", s->instrument_names[k], n + 1);
         ret = ss_dump_tensor(ctx, name, raw[n]);
+    }
+    for (n = 0; ret >= 0 && n < 6; n++) {
+        snprintf(name, sizeof(name), "%s.up%d", s->instrument_names[k], n + 1);
+        ret = ss_dump_tensor(ctx, name, up[n]);
+    }
+    if (ret >= 0) {
+        /* "out" is the sigmoid mask, matching dump_reference.py's tap: it
+         * records `out` and multiplies separately into an untapped tensor.
+         * The estimated magnitude goes out through `est`, not through the
+         * fixture named "out". */
+        snprintf(name, sizeof(name), "%s.out", s->instrument_names[k]);
+        ret = ss_dump_tensor(ctx, name, mask);
+    }
+    if (ret >= 0) {
+        /* Not a fixture -- compare.py iterates fixture keys and never looks
+         * for this -- but it makes the mask multiply checkable from outside
+         * the filter: est must equal out * input, element for element. */
+        snprintf(name, sizeof(name), "%s.est", s->instrument_names[k]);
+        ret = ss_dump_tensor(ctx, name, est_t);
     }
 
 done:
@@ -1048,10 +1270,45 @@ done:
     return ret;
 }
 
-/* Runs every instrument's encoder once on the injected spectrogram. */
+/* Runs the network over one segment's magnitude spectrogram, once per
+ * instrument.
+ *
+ * `mag` is [C=2][T=512][F=1024] float32, frequency contiguous. out[i], when
+ * non-NULL, receives instrument i's estimated magnitude in the same layout.
+ * The caller owns both buffers.
+ *
+ * Deliberately stops at the per-instrument estimates. Combining them into the
+ * ratio mask that gets applied to the mixture, segmenting a stream into these
+ * fixed T=512 windows and overlapping the results all belong to the segment
+ * driver, not here.
+ */
+static int ss_infer(AVFilterContext *ctx, const float *mag,
+                    float *out[SS_NB_INSTRUMENTS])
+{
+    StemSplitContext *s = ctx->priv;
+    int k, ret;
+
+    for (k = 0; k < s->nb_instruments; k++) {
+        ret = ss_run_network_once(ctx, k, mag, out ? out[k] : NULL);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+/* Runs the whole network once per instrument on the injected spectrogram.
+ *
+ * The estimated-magnitude buffers are allocated and thrown away here. They
+ * are not wasted: they are what makes ss_infer's output path -- the thing the
+ * segment driver will actually consume -- run under the parity test rather
+ * than sitting untested until a later task wires it up.
+ */
 static int ss_run_debug_input(AVFilterContext *ctx)
 {
     StemSplitContext *s = ctx->priv;
+    const size_t bytes = (size_t) SS_CHANNELS * SS_T * SS_F * sizeof(float);
+    float *out[SS_NB_INSTRUMENTS] = { NULL };
     float *data = NULL;
     int k, ret;
 
@@ -1060,14 +1317,22 @@ static int ss_run_debug_input(AVFilterContext *ctx)
         return ret;
 
     for (k = 0; k < s->nb_instruments; k++) {
-        ret = ss_run_encoder_once(ctx, k, data);
-        if (ret < 0)
-            break;
-        av_log(ctx, AV_LOG_INFO,
-               "stemsplit: debug_input encoder pass complete for '%s'.\n",
-               s->instrument_names[k]);
+        out[k] = av_malloc(bytes);
+        if (!out[k]) {
+            ret = AVERROR(ENOMEM);
+            goto done;
+        }
     }
 
+    ret = ss_infer(ctx, data, out);
+    if (ret >= 0)
+        av_log(ctx, AV_LOG_INFO,
+               "stemsplit: debug_input forward pass complete for %d "
+               "instrument(s).\n", s->nb_instruments);
+
+done:
+    for (k = 0; k < SS_NB_INSTRUMENTS; k++)
+        av_freep(&out[k]);
     av_freep(&data);
 
     return ret;
