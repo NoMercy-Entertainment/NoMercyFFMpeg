@@ -34,6 +34,22 @@ mismatch. See `build_unet()` below for the full derivation, including
 the conv6 bottleneck's extra wrinkle (its BN/activation are pure dead
 code, computed but never consumed anywhere).
 
+Precision: conv kernels are loaded F16-rounded (`load_weights()` does
+`kernel.astype(np.float16).astype(np.float32)` before handing them to
+Keras). This is deliberate, not a bug -- convert.py ships `.weight`
+tensors as F16 (Ruling 7; `conv_weight()`, `verify_dtypes()`), so the
+runtime never sees full-precision kernels. A fixture computed from
+unrounded F32 kernels describes a different, more precise network than
+the one that actually ships, and F16's ~1e-3 rounding error alone can
+exceed compare.py's default rtol -- large enough to fail a bit-correct
+ggml implementation for a reason that has nothing to do with its
+correctness. **This coupling is load-bearing: if the artifact's
+precision ever changes (e.g. a future F32 or Q8 GGUF), these fixtures
+must be regenerated to match, or the parity test again measures a
+precision difference instead of a correctness one.** Biases and
+BatchNorm's affine terms stay F32 throughout, matching the shipped
+artifact (convert.py's EXPECTED / verify_dtypes()).
+
 Usage:
     python dump_reference.py --checkpoint /work/2stems \
         --fixtures /out/fixtures.json --raw-dir /out/ref
@@ -157,13 +173,27 @@ def build_unet(input_tensor):
 def load_weights(reader, mapping, model):
     """Set every Conv2D/Conv2DTranspose/BatchNormalization layer's weights
     from the checkpoint, using build_mapping()'s resolved TF variable names.
-    Weights are pulled TF-native (no ggml axis swap, no fp16 cast) since
-    this Keras model must run the real TF numerics, not the runtime's
-    packed layout."""
+    Weights are pulled TF-native (no ggml axis swap) since this Keras
+    model must run the real TF numerics, not the runtime's packed layout.
+
+    Conv kernels are round-tripped through float16 before being handed to
+    Keras (still stored and computed as F32 -- only the *values* are
+    rounded to what F16 can represent). This mirrors convert.py's
+    conv_weight(), which casts every `.weight` tensor to F16 for the
+    shipped GGUF (Ruling 7: weights are F16, everything else stays F32).
+    Ruling 14: the reference must be generated from the same rounded
+    values the runtime actually loads, or the comparison is between two
+    different networks -- a full-precision one here and a half-precision
+    one at runtime -- and F16's ~1e-3 rounding error alone can exceed
+    compare.py's rtol, failing a bit-correct ggml implementation. Biases
+    and BatchNorm's affine terms are F32 in the shipped artifact (see
+    convert.py's EXPECTED / verify_dtypes()) and are therefore loaded
+    at full precision here, unrounded."""
     for layer_id, entry in mapping.items():
         _, layer_name = layer_id.split(".", 1)
         conv_name = entry["conv"]
-        kernel = reader.get_tensor(f"{conv_name}/kernel").astype(np.float32)
+        kernel = reader.get_tensor(f"{conv_name}/kernel")
+        kernel = kernel.astype(np.float16).astype(np.float32)  # F16-round, keep F32 dtype
         bias = reader.get_tensor(f"{conv_name}/bias").astype(np.float32)
         keras_layer = model.get_layer(layer_name)
         keras_layer.set_weights([kernel, bias])
