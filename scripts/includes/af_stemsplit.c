@@ -23,16 +23,20 @@
  * Deezer Spleeter 2stems network, run on ggml (the same library statically
  * linked into this binary for the whisper filter, via whisper.pc).
  *
- * The filter registers, negotiates 44.1 kHz stereo planar float, and can
- * round-trip audio through STFT analysis/synthesis (passthrough_dsp) or
- * load and validate the model's 100 GGUF tensors (ss_model_load). The whole
- * network is built and runs on ggml -- ss_build_encoder, ss_build_decoder and
- * ss_infer -- producing each instrument's estimated magnitude spectrogram.
- * The real per-segment driver, which turns those estimates into a ratio mask
- * and writes stems to output pads, is a later task. For now ss_infer is
- * reachable only through the internal debug_input option, which injects a
- * spectrogram straight from disk for the per-layer parity test of design
- * section 9.2.
+ * The filter negotiates 44.1 kHz stereo planar float, loads and validates the
+ * model's 100 GGUF tensors (ss_model_load), builds the two U-Nets into a
+ * single ggml graph once (ss_graph_build) and reuses it for every segment.
+ * The segment driver (ss_push_samples / ss_process_segment) runs a 4096-point
+ * STFT at hop 1024, hands each 512-frame segment's magnitude to the networks,
+ * turns their estimated magnitudes into ratio masks (ss_build_masks), extends
+ * those masks over the band the network does not model (`highband`), applies
+ * them to the ORIGINAL complex mixture spectrum -- the mixture's phase is
+ * reused unchanged -- and resynthesises one stem per output pad.
+ *
+ * `debug_input` remains an internal parity hook: it injects a spectrogram
+ * straight from disk, runs the networks on it once and dumps every layer tap
+ * for the per-layer comparison of design section 9.2. It bypasses the audio
+ * driver entirely.
  */
 
 #include <inttypes.h>
@@ -69,8 +73,34 @@
 #define SS_EPSILON      1e-10f
 #define SS_WINDOW_COMPENSATION (2.0f / 3.0f)
 
+/* Stride between consecutive spectra in the segment ring, in complex floats.
+ *
+ * av_tx writes its output with aligned SIMD stores unless AV_TX_UNALIGNED was
+ * requested at init, so every spectrum it is handed must start on a 64-byte
+ * boundary. SS_BINS is 2049 -- odd -- so packing spectra back to back would
+ * put every second one 8 bytes off and fault on the first vmovaps. Rounding
+ * the stride up to a multiple of 8 complex floats makes each spectrum start
+ * 16448 bytes (257 * 64) apart, and av_calloc already returns a 64-byte
+ * aligned base. The padding bins are never read. */
+#define SS_SPEC_STRIDE  FFALIGN(SS_BINS, 8)
+
 enum { SS_STEM_VOCALS, SS_STEM_ACCOMPANIMENT, SS_STEM_ALL };
 enum { SS_HB_PASSTHROUGH, SS_HB_ZEROS, SS_HB_AVERAGE };
+
+/* Index into a per-segment mask: [C][T][SS_BINS] float, bin fastest. The
+ * network's own tensors are [C][T][SS_F] instead -- the model only predicts
+ * the lower SS_F of the SS_BINS bins -- so the two layouts are deliberately
+ * not interchangeable and get separate accessors. */
+static inline size_t ss_idx(int c, int t, int f)
+{
+    return ((size_t) c * SS_T + t) * SS_BINS + f;
+}
+
+/* Index into a network input/output tensor: [C][T][SS_F] float. */
+static inline size_t ss_nidx(int c, int t, int f)
+{
+    return ((size_t) c * SS_T + t) * SS_F + f;
+}
 
 /* ---- Model tensors (Task 6) ---------------------------------------------
  *
@@ -110,7 +140,6 @@ typedef struct StemSplitContext {
     int      nb_threads;
     char    *dump_dir;
     char    *debug_input_path;
-    int      passthrough_dsp;
 
     /* STFT / inverse STFT (Task 5): a 4096-point av_tx real DFT pair at hop
      * 1024, with a periodic Hann window applied on both analysis and
@@ -127,30 +156,12 @@ typedef struct StemSplitContext {
                                 * ss_synthesize() hands to the inverse transform,
                                 * which overwrites its input */
 
-    /* Minimal frame-hop driver used by `passthrough_dsp` to exercise
-     * ss_analyze()/ss_synthesize() end to end for the round-trip test. Task
-     * 9's real T=512 segmenter (ss_process_segment) replaces this; plain
-     * hop-by-hop overlap-add doesn't need to know about network segments,
-     * so this is deliberately not organised around them. */
-    float   *pt_window[SS_CHANNELS]; /* sliding SS_FRAME_LENGTH analysis window */
-    float   *pt_stage[SS_CHANNELS];  /* raw samples waiting to complete the next hop */
-    AVComplexFloat *pt_spec;         /* SS_BINS scratch: this hop's analyzed spectrum.
-                                       * Heap-allocated (av_malloc is SIMD-aligned) rather
-                                       * than a local, since av_tx requires aligned buffers
-                                       * unless AV_TX_UNALIGNED was set at init. */
-    int      pt_stage_fill;          /* valid samples in pt_stage, 0..SS_FRAME_STEP */
-    int64_t  pt_crop_remaining;      /* output samples still to discard (the lead-in) */
-    int64_t  pt_total_in;            /* real input samples received so far */
-    int64_t  pt_emitted;             /* real (post-crop) output samples emitted so far */
-
     /* Model loading (Task 6): 100 GGUF tensors resolved by name into two
-     * SSNet structures and validated by dtype and shape. Loading only --
-     * no compute graph is built from these until Tasks 7/8. */
+     * SSNet structures and validated by dtype and shape. */
     struct ggml_context        *gguf_ctx;    /* owns all tensor metadata and data;
                                                * created by gguf_init_from_file with
                                                * no_alloc=false, freed in ss_model_free */
-    struct ggml_backend        *backend;     /* CPU backend, set up here for the
-                                               * compute-graph tasks to reuse */
+    struct ggml_backend        *backend;     /* CPU backend */
     struct ggml_backend_buffer *weights_buf; /* unused for now: no_alloc=false already
                                                * backs every weight tensor with plain
                                                * host memory inside gguf_ctx, so there is
@@ -163,7 +174,72 @@ typedef struct StemSplitContext {
     int      nb_instruments;
     char    *instrument_names[SS_NB_INSTRUMENTS];
 
+    /* Compute graph (design 6.3: "built once and reused"). Both instruments'
+     * networks live in ONE graph sharing ONE input tensor, so ggml_gallocr's
+     * liveness analysis can hand the second network the memory the first has
+     * finished with -- two separate graphs would keep both networks'
+     * activations resident at once. Built lazily on the first inference and
+     * kept for the whole filter's life; see ss_graph_build. */
+    struct ggml_context *graph_ctx;
+    struct ggml_cgraph  *graph;
+    struct ggml_gallocr *galloc;
+    struct ggml_tensor  *g_input;
+    struct ggml_tensor  *g_est[SS_NB_INSTRUMENTS];   /* estimated magnitude S_i */
+    struct ggml_tensor  *g_mask[SS_NB_INSTRUMENTS];  /* the raw sigmoid, a fixture tap */
+    struct ggml_tensor  *g_raw[SS_NB_INSTRUMENTS][6];
+    struct ggml_tensor  *g_up[SS_NB_INSTRUMENTS][6];
+
+    /* ---- Segment driver (Task 9) ----------------------------------------
+     *
+     * Analysis slides an SS_FRAME_LENGTH window over the input in SS_FRAME_STEP
+     * hops, starting from an all-zero window: that zero window IS the design's
+     * 4096-sample lead-in (design 4.2 step 1), and crop_remaining discards the
+     * matching 4096 output samples again at step 9.
+     *
+     * Frame spectra land in a ring of exactly SS_T slots. Segment k covers
+     * global frames [k*hop_frames, k*hop_frames + SS_T), which is the whole
+     * ring, and the frames it retires -- [k*hop_frames, (k+1)*hop_frames) --
+     * are precisely the slots the next segment's new frames overwrite, so the
+     * ring never needs to be larger than one segment.
+     */
+    int      overlap_frames;  /* `overlap` converted to frames, clamped [0, SS_T-1] */
+    int      hop_frames;      /* SS_T - overlap_frames: frames retired per segment */
+    int      nb_outputs;      /* 2 for stem=all, else 1 */
+    int      out_inst[SS_NB_INSTRUMENTS];  /* output pad -> instrument index */
+
+    float   *an_window[SS_CHANNELS]; /* SS_FRAME_LENGTH sliding analysis window */
+    float   *an_stage[SS_CHANNELS];  /* SS_FRAME_STEP staging for a partial hop */
+    int      an_stage_fill;
+    AVComplexFloat *spec_ring;       /* [SS_T][SS_CHANNELS][SS_SPEC_STRIDE] mixture STFT */
+    float   *mag;                    /* [C][T][F] network input, one segment */
+    float   *est[SS_NB_INSTRUMENTS]; /* [C][T][F] estimated magnitudes */
+    float   *mask[SS_NB_INSTRUMENTS];/* [C][T][SS_BINS] this segment's ratio masks */
+
+    /* Only allocated when overlap != 0. Overlapping segments disagree about
+     * the mask for the frames they share, so each segment's masks are summed
+     * into a ring with a per-frame taper (seg_win) and divided by the summed
+     * weight (w_acc) when the frame retires. At overlap=0 every weight is 1
+     * and exactly one segment covers each frame, so this whole path is skipped
+     * and the result is bit-identical to the unblended mask. */
+    float   *mask_acc[SS_NB_INSTRUMENTS];
+    float   *w_acc;                  /* [SS_T] summed taper per ring slot */
+    float   *seg_win;                /* [SS_T] per-frame taper within a segment */
+    int64_t  acc_filled;             /* global frame index accumulation has reached */
+
+    AVComplexFloat *work_spec;              /* SS_BINS scratch: masked spectrum */
+    float   *ola[SS_NB_INSTRUMENTS][SS_CHANNELS]; /* SS_FRAME_LENGTH per output pad */
+
+    int64_t  frames_in;      /* frames analysed into the ring */
+    int64_t  frames_done;    /* frames retired: masked, synthesised, emitted */
+    int64_t  next_segment;   /* index of the next segment to run */
+    int64_t  crop_remaining; /* lead-in output samples still to discard */
+    int64_t  total_in;       /* real input samples received */
+    int64_t  emitted;        /* real (post-crop) output samples emitted */
+    int      started;        /* the zero lead-in frame has been pushed */
+    int      flushing;       /* inside the EOF drain: cap output at total_in */
+
     int      eof;
+    int      status;
     int64_t  next_pts;
 } StemSplitContext;
 
@@ -696,14 +772,15 @@ done:
  * which is also the byte layout the fixtures and ss_dump_tensor use.
  */
 
-/* Graph-metadata budget for one instrument's full forward pass. An encoder
- * block builds about ten tensors (pad, kernel cast, conv, bias reshape + add,
- * two BatchNorm reshapes + mul + add, leaky_relu) and a decoder block about
- * twelve (kernel cast, transposed conv, crop view + cont, bias reshape + add,
- * relu, two BatchNorm reshapes + mul + add, concat), with six more for the
- * output layer -- roughly 140 in total. The margin is deliberate; this is a
- * tripwire that fails loudly rather than a target. */
-#define SS_GRAPH_TENSORS 512
+/* Graph-metadata budget for the full forward pass of BOTH instruments,
+ * which now share a single graph. An encoder block builds about ten tensors
+ * (pad, kernel cast, conv, bias reshape + add, two BatchNorm reshapes + mul
+ * + add, leaky_relu) and a decoder block about twelve (kernel cast,
+ * transposed conv, crop view + cont, bias reshape + add, relu, two BatchNorm
+ * reshapes + mul + add, concat), with six more for the output layer --
+ * roughly 140 per instrument, so about 280 in total. The margin is
+ * deliberate; this is a tripwire that fails loudly rather than a target. */
+#define SS_GRAPH_TENSORS 1024
 
 /* TensorFlow's "SAME" padding for kernel 5 / stride 2 is asymmetric: for an
  * input of N (even), the output is N/2 and the total padding is
@@ -1079,6 +1156,215 @@ static int ss_dump_tensor(AVFilterContext *ctx, const char *name,
     return 0;
 }
 
+/* ---- Inference driver ---------------------------------------------------
+ *
+ * The production entry point into the network. Design section 6.3 says the
+ * graph is "built once and reused"; ss_graph_build does that, and ss_infer
+ * only writes a new segment's magnitude into the shared input tensor and
+ * recomputes.
+ *
+ * It is built lazily, on the first inference, rather than in init(). FFmpeg
+ * constructs a filtergraph twice, so init() runs twice per command line and a
+ * graph built there would be allocated twice -- once for a context that never
+ * sees a sample. "Once" is the property design 6.3 asks for; init() is only
+ * where it expected to get it.
+ *
+ * Both instruments share ONE ggml graph and ONE input tensor. They are
+ * independent subgraphs expanded back to back, so ggml_gallocr can hand the
+ * second network the activation memory the first has finished with; two
+ * separate graphs would need two buffers sized for the peak, both resident.
+ */
+
+static void ss_graph_free(StemSplitContext *s)
+{
+    if (s->galloc)
+        ggml_gallocr_free(s->galloc);
+    s->galloc = NULL;
+
+    if (s->graph_ctx)
+        ggml_free(s->graph_ctx);
+    s->graph_ctx = NULL;
+
+    /* All tensors below lived in graph_ctx, freed above: NULL them so a stray
+     * use-after-free reads NULL rather than garbage. */
+    s->graph   = NULL;
+    s->g_input = NULL;
+    memset(s->g_est,  0, sizeof(s->g_est));
+    memset(s->g_mask, 0, sizeof(s->g_mask));
+    memset(s->g_raw,  0, sizeof(s->g_raw));
+    memset(s->g_up,   0, sizeof(s->g_up));
+}
+
+static int ss_graph_build(AVFilterContext *ctx)
+{
+    StemSplitContext *s = ctx->priv;
+    /* Design section 9.2's parity taps are pinned as graph outputs so
+     * ggml_gallocr cannot recycle them before they are dumped. That pinning
+     * costs about 43 MiB per instrument, so it is done only when `dump` is
+     * actually set -- a production run keeps just the two estimates alive. */
+    const int taps = s->dump_dir && *s->dump_dir;
+    struct ggml_init_params ip = {
+        .mem_size   = ggml_tensor_overhead() * SS_GRAPH_TENSORS +
+                      ggml_graph_overhead(),
+        .mem_buffer = NULL,
+        /* Metadata only: ggml_gallocr owns the activation memory. */
+        .no_alloc   = true,
+    };
+    struct ggml_context *g;
+    struct ggml_cgraph *gf;
+    int k, n;
+
+    av_assert0(!s->graph_ctx);
+
+    g = ggml_init(ip);
+    if (!g)
+        return AVERROR(ENOMEM);
+    s->graph_ctx = g;
+
+    s->g_input = ggml_new_tensor_4d(g, GGML_TYPE_F32, SS_F, SS_T, SS_CHANNELS, 1);
+    ggml_set_name(s->g_input, "input");
+    ggml_set_input(s->g_input);
+    if (taps)
+        /* ggml_gallocr never recycles a tensor flagged output, so the injected
+         * values survive the compute and the dumped <instrument>.input.f32 is
+         * a genuine record of what the graph consumed rather than a copy of
+         * what we meant to give it. */
+        ggml_set_output(s->g_input);
+
+    gf = ggml_new_graph(g);
+    if (!gf) {
+        ss_graph_free(s);
+        return AVERROR(ENOMEM);
+    }
+
+    for (k = 0; k < s->nb_instruments; k++) {
+        ss_build_encoder(g, s->g_input, &s->nets[k], s->g_raw[k]);
+        ss_build_decoder(g, s->g_input, s->g_raw[k], &s->nets[k], s->g_up[k],
+                         &s->g_mask[k], &s->g_est[k]);
+
+        if (taps) {
+            for (n = 0; n < 6; n++) {
+                ggml_set_output(s->g_raw[k][n]);
+                ggml_build_forward_expand(gf, s->g_raw[k][n]);
+            }
+            for (n = 0; n < 6; n++) {
+                ggml_set_output(s->g_up[k][n]);
+                ggml_build_forward_expand(gf, s->g_up[k][n]);
+            }
+            ggml_set_output(s->g_mask[k]);
+            ggml_build_forward_expand(gf, s->g_mask[k]);
+        }
+
+        /* The estimated magnitude is what the ratio-mask formula consumes, so
+         * it is pinned on every path, dumping or not. Expanding it pulls in
+         * that instrument's entire network. */
+        ggml_set_output(s->g_est[k]);
+        ggml_build_forward_expand(gf, s->g_est[k]);
+    }
+
+    s->graph = gf;
+
+    s->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s->backend));
+    if (!s->galloc || !ggml_gallocr_alloc_graph(s->galloc, gf)) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Could not allocate the stemsplit compute graph.\n");
+        ss_graph_free(s);
+        return AVERROR(ENOMEM);
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE,
+           "stemsplit: compute graph built once, %d node(s) for %d "
+           "instrument(s), %.1f MiB of activations.\n",
+           ggml_graph_n_nodes(gf), s->nb_instruments,
+           ggml_gallocr_get_buffer_size(s->galloc, 0) / (1024.0 * 1024.0));
+
+    return 0;
+}
+
+/* Dumps every parity tap of the last compute. A no-op unless `dump` is set,
+ * in which case ss_graph_build has pinned the tensors this reads. */
+static int ss_dump_taps(AVFilterContext *ctx)
+{
+    StemSplitContext *s = ctx->priv;
+    char name[80];
+    int k, n, ret = 0;
+
+    if (!s->dump_dir || !*s->dump_dir)
+        return 0;
+
+    for (k = 0; ret >= 0 && k < s->nb_instruments; k++) {
+        snprintf(name, sizeof(name), "%s.input", s->instrument_names[k]);
+        ret = ss_dump_tensor(ctx, name, s->g_input);
+
+        for (n = 0; ret >= 0 && n < 6; n++) {
+            snprintf(name, sizeof(name), "%s.conv%d", s->instrument_names[k], n + 1);
+            ret = ss_dump_tensor(ctx, name, s->g_raw[k][n]);
+        }
+        for (n = 0; ret >= 0 && n < 6; n++) {
+            snprintf(name, sizeof(name), "%s.up%d", s->instrument_names[k], n + 1);
+            ret = ss_dump_tensor(ctx, name, s->g_up[k][n]);
+        }
+        if (ret >= 0) {
+            /* "out" is the sigmoid mask, matching dump_reference.py's tap: it
+             * records `out` and multiplies separately into an untapped tensor.
+             * The estimated magnitude goes out through ss_infer's `out`
+             * parameter, not through the fixture named "out". */
+            snprintf(name, sizeof(name), "%s.out", s->instrument_names[k]);
+            ret = ss_dump_tensor(ctx, name, s->g_mask[k]);
+        }
+        if (ret >= 0) {
+            /* Not a fixture -- compare.py iterates fixture keys and never
+             * looks for this -- but it makes the mask multiply checkable from
+             * outside the filter: est must equal out * input, element for
+             * element. */
+            snprintf(name, sizeof(name), "%s.est", s->instrument_names[k]);
+            ret = ss_dump_tensor(ctx, name, s->g_est[k]);
+        }
+    }
+
+    return ret;
+}
+
+/* Runs both networks over one segment's magnitude spectrogram.
+ *
+ * `mag` is [C=2][T=512][F=1024] float32, frequency contiguous -- byte for byte
+ * ggml's ne = [F, T, C, 1]. out[i], when non-NULL, receives instrument i's
+ * ESTIMATED MAGNITUDE S_i = sigmoid_mask * mag in the same layout (Ruling 17),
+ * not the bare sigmoid. The caller owns both buffers.
+ */
+static int ss_infer(AVFilterContext *ctx, const float *mag,
+                    float *out[SS_NB_INSTRUMENTS])
+{
+    StemSplitContext *s = ctx->priv;
+    const size_t bytes = (size_t) SS_CHANNELS * SS_T * SS_F * sizeof(float);
+    int k, ret;
+
+    if (!s->graph) {
+        ret = ss_graph_build(ctx);
+        if (ret < 0)
+            return ret;
+    }
+
+    ggml_backend_tensor_set(s->g_input, mag, 0, bytes);
+
+    ggml_backend_cpu_set_n_threads(s->backend, s->nb_threads > 0 ? s->nb_threads
+                                   : FFMAX(1, ff_filter_get_nb_threads(ctx)));
+
+    if (ggml_backend_graph_compute(s->backend, s->graph) != GGML_STATUS_SUCCESS) {
+        av_log(ctx, AV_LOG_ERROR, "stemsplit: graph computation failed.\n");
+        return AVERROR_EXTERNAL;
+    }
+
+    for (k = 0; k < s->nb_instruments; k++) {
+        if (!out || !out[k])
+            continue;
+        av_assert0(ggml_nbytes(s->g_est[k]) == bytes);
+        ggml_backend_tensor_get(s->g_est[k], out[k], 0, bytes);
+    }
+
+    return ss_dump_taps(ctx);
+}
+
 /* ---- Internal parity path: `debug_input` --------------------------------
  *
  * Design section 9.2 compares the network layer by layer against a Python
@@ -1148,155 +1434,6 @@ static int ss_read_debug_input(AVFilterContext *ctx, float **out)
     return ret;
 }
 
-/* Builds, allocates and runs one instrument's full network on `mag`, dumping
- * every parity tap along the way.
- *
- * `est`, when non-NULL, receives this instrument's estimated magnitude
- * spectrogram -- the sigmoid mask multiplied by `mag` -- in the same
- * [C][T][F] float32 layout `mag` uses, which is ggml's ne = [F, T, C, 1] byte
- * for byte, so it is a straight copy out of the graph with no reordering.
- */
-static int ss_run_network_once(AVFilterContext *ctx, int k, const float *mag,
-                               float *est)
-{
-    StemSplitContext *s = ctx->priv;
-    const size_t input_bytes = (size_t) SS_CHANNELS * SS_T * SS_F * sizeof(float);
-    struct ggml_init_params ip = {
-        .mem_size   = ggml_tensor_overhead() * SS_GRAPH_TENSORS +
-                      ggml_graph_overhead(),
-        .mem_buffer = NULL,
-        /* Metadata only: ggml_gallocr owns the activation memory. */
-        .no_alloc   = true,
-    };
-    struct ggml_context *g;
-    struct ggml_gallocr *galloc = NULL;
-    struct ggml_cgraph *gf;
-    struct ggml_tensor *input, *raw[6], *up[6], *mask, *est_t;
-    char name[80];
-    int n, ret = 0;
-
-    g = ggml_init(ip);
-    if (!g)
-        return AVERROR(ENOMEM);
-
-    input = ggml_new_tensor_4d(g, GGML_TYPE_F32, SS_F, SS_T, SS_CHANNELS, 1);
-    ggml_set_name(input, "input");
-    ggml_set_input(input);
-    /* Also flagged as an output: ggml_gallocr never recycles the memory of a
-     * tensor flagged output, so the injected values survive the compute and
-     * can be read back afterwards. That is what makes the dumped
-     * <instrument>.input.f32 a genuine record of what the graph consumed
-     * rather than a copy of what we meant to give it. */
-    ggml_set_output(input);
-
-    ss_build_encoder(g, input, &s->nets[k], raw);
-    ss_build_decoder(g, input, raw, &s->nets[k], up, &mask, &est_t);
-
-    gf = ggml_new_graph(g);
-    /* Expanding est_t pulls in the whole graph; the taps are flagged as
-     * outputs and expanded individually so ggml_gallocr cannot recycle their
-     * memory once their last consumer has run, which would leave the dumps
-     * reading whatever the allocator reused the block for. */
-    for (n = 0; n < 6; n++) {
-        ggml_set_output(raw[n]);
-        ggml_build_forward_expand(gf, raw[n]);
-    }
-    for (n = 0; n < 6; n++) {
-        ggml_set_output(up[n]);
-        ggml_build_forward_expand(gf, up[n]);
-    }
-    ggml_set_output(mask);
-    ggml_build_forward_expand(gf, mask);
-    ggml_set_output(est_t);
-    ggml_build_forward_expand(gf, est_t);
-
-    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s->backend));
-    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
-        av_log(ctx, AV_LOG_ERROR,
-               "Could not allocate the stemsplit compute graph.\n");
-        ret = AVERROR(ENOMEM);
-        goto done;
-    }
-
-    /* Only now that gallocr has backed the graph does the input tensor have
-     * a buffer to be written into. */
-    ggml_backend_tensor_set(input, mag, 0, input_bytes);
-
-    ggml_backend_cpu_set_n_threads(s->backend, s->nb_threads > 0 ? s->nb_threads
-                                   : FFMAX(1, ff_filter_get_nb_threads(ctx)));
-
-    if (ggml_backend_graph_compute(s->backend, gf) != GGML_STATUS_SUCCESS) {
-        av_log(ctx, AV_LOG_ERROR, "stemsplit: graph computation failed.\n");
-        ret = AVERROR_EXTERNAL;
-        goto done;
-    }
-
-    if (est) {
-        av_assert0(ggml_nbytes(est_t) == input_bytes);
-        ggml_backend_tensor_get(est_t, est, 0, input_bytes);
-    }
-
-    snprintf(name, sizeof(name), "%s.input", s->instrument_names[k]);
-    ret = ss_dump_tensor(ctx, name, input);
-
-    for (n = 0; ret >= 0 && n < 6; n++) {
-        snprintf(name, sizeof(name), "%s.conv%d", s->instrument_names[k], n + 1);
-        ret = ss_dump_tensor(ctx, name, raw[n]);
-    }
-    for (n = 0; ret >= 0 && n < 6; n++) {
-        snprintf(name, sizeof(name), "%s.up%d", s->instrument_names[k], n + 1);
-        ret = ss_dump_tensor(ctx, name, up[n]);
-    }
-    if (ret >= 0) {
-        /* "out" is the sigmoid mask, matching dump_reference.py's tap: it
-         * records `out` and multiplies separately into an untapped tensor.
-         * The estimated magnitude goes out through `est`, not through the
-         * fixture named "out". */
-        snprintf(name, sizeof(name), "%s.out", s->instrument_names[k]);
-        ret = ss_dump_tensor(ctx, name, mask);
-    }
-    if (ret >= 0) {
-        /* Not a fixture -- compare.py iterates fixture keys and never looks
-         * for this -- but it makes the mask multiply checkable from outside
-         * the filter: est must equal out * input, element for element. */
-        snprintf(name, sizeof(name), "%s.est", s->instrument_names[k]);
-        ret = ss_dump_tensor(ctx, name, est_t);
-    }
-
-done:
-    ggml_gallocr_free(galloc);
-    ggml_free(g);
-
-    return ret;
-}
-
-/* Runs the network over one segment's magnitude spectrogram, once per
- * instrument.
- *
- * `mag` is [C=2][T=512][F=1024] float32, frequency contiguous. out[i], when
- * non-NULL, receives instrument i's estimated magnitude in the same layout.
- * The caller owns both buffers.
- *
- * Deliberately stops at the per-instrument estimates. Combining them into the
- * ratio mask that gets applied to the mixture, segmenting a stream into these
- * fixed T=512 windows and overlapping the results all belong to the segment
- * driver, not here.
- */
-static int ss_infer(AVFilterContext *ctx, const float *mag,
-                    float *out[SS_NB_INSTRUMENTS])
-{
-    StemSplitContext *s = ctx->priv;
-    int k, ret;
-
-    for (k = 0; k < s->nb_instruments; k++) {
-        ret = ss_run_network_once(ctx, k, mag, out ? out[k] : NULL);
-        if (ret < 0)
-            return ret;
-    }
-
-    return 0;
-}
-
 /* Runs the whole network once per instrument on the injected spectrogram.
  *
  * The estimated-magnitude buffers are allocated and thrown away here. They
@@ -1338,131 +1475,608 @@ done:
     return ret;
 }
 
-/* ---- Minimal round-trip driver for `passthrough_dsp` -------------------
+/* ---- Ratio masks and high-band extension --------------------------------
  *
- * Feeds SS_FRAME_LENGTH zeros ahead of the first real sample (the lead-in),
- * runs ss_analyze()/ss_synthesize() back to back with no mask at hop
- * SS_FRAME_STEP, and crops the first SS_FRAME_LENGTH output samples so the
- * round trip lines up with the original signal. Task 9's real segmenter
- * replaces all of this; it exists only so Task 5 has something an ordinary
- * ffmpeg invocation can measure.
+ * Design section 4.2 step 5, reproduced exactly:
+ *
+ *     output_sum = sum_j (S_j ^ 2) + EPSILON
+ *     mask_i     = (S_i ^ 2 + EPSILON / N) / output_sum
+ *
+ * EPSILON appears TWICE with different scaling -- whole in the denominator,
+ * divided by N in the numerator. That is upstream Spleeter's formula, not a
+ * typo, and it is what makes the masks sum to exactly 1 when every estimate is
+ * zero (silence) instead of 0/0. Do not "simplify" the two terms into one.
+ *
+ * The separation exponent is 2, so S_i^2 is written out rather than reached
+ * through powf: a fixed exponent of 2 is the released 2stems configuration.
+ *
+ * Above bin SS_F (11 025 Hz) the network predicts nothing at all, so the mask
+ * there is a policy decision rather than a computation -- design section 7.
+ */
+static void ss_build_masks(StemSplitContext *s, const float *est[SS_NB_INSTRUMENTS],
+                           float *mask[SS_NB_INSTRUMENTS])
+{
+    const int n = s->nb_instruments;
+    int c, t, f, i;
+
+    for (c = 0; c < SS_CHANNELS; c++)
+        for (t = 0; t < SS_T; t++) {
+            for (f = 0; f < SS_F; f++) {
+                const size_t k = ss_nidx(c, t, f);
+                float sum = SS_EPSILON;
+
+                for (i = 0; i < n; i++)
+                    sum += est[i][k] * est[i][k];
+                for (i = 0; i < n; i++)
+                    mask[i][ss_idx(c, t, f)] =
+                        (est[i][k] * est[i][k] + SS_EPSILON / n) / sum;
+            }
+
+            /* ---- the band the network does not model ---- */
+            switch (s->highband) {
+            case SS_HB_ZEROS:
+                /* Upstream Spleeter ("mask_extension": "zeros"): silent above
+                 * 11 kHz in every stem. Kept so the parity tests have
+                 * something bit-comparable to compare against. */
+                for (i = 0; i < n; i++)
+                    memset(mask[i] + ss_idx(c, t, SS_F), 0,
+                           (SS_BINS - SS_F) * sizeof(float));
+                break;
+
+            case SS_HB_AVERAGE:
+                /* Spleeter's other documented mode: this frame's mask averaged
+                 * over the modelled bins, tiled across the rest. */
+                for (i = 0; i < n; i++) {
+                    const float *m = mask[i] + ss_idx(c, t, 0);
+                    float *hi = mask[i] + ss_idx(c, t, SS_F);
+                    double acc = 0.0;
+                    float v;
+
+                    for (f = 0; f < SS_F; f++)
+                        acc += m[f];
+                    v = (float) (acc / SS_F);
+                    for (f = 0; f < SS_BINS - SS_F; f++)
+                        hi[f] = v;
+                }
+                break;
+
+            case SS_HB_PASSTHROUGH:
+            default:
+                /* The default, and an explicit product decision: the untouched
+                 * high band goes to exactly one stem -- the LAST instrument in
+                 * the model's list, which for 2stems is accompaniment -- and is
+                 * zeroed in the others. Cymbals and air survive in a karaoke
+                 * track, which upstream's "zeros" throws away. */
+                for (i = 0; i < n; i++) {
+                    float *hi = mask[i] + ss_idx(c, t, SS_F);
+                    const float v = i == n - 1 ? 1.0f : 0.0f;
+
+                    for (f = 0; f < SS_BINS - SS_F; f++)
+                        hi[f] = v;
+                }
+                break;
+            }
+        }
+}
+
+/* ---- Segment driver -----------------------------------------------------
+ *
+ * Design section 4.2 steps 1 to 3 and 7 to 9, streamed.
+ *
+ * Analysis slides a 4096-sample window over the input in 1024-sample hops.
+ * The window starts all-zero and the first frame is analysed before any real
+ * sample arrives: that zero window IS step 1's 4096-sample lead-in, and
+ * crop_remaining discards the matching 4096 output samples in step 9. Framing
+ * a signal that has 4096 zeros glued to its front is exactly what a zeroed
+ * sliding window does, so the lead-in costs one frame, not a copy of the
+ * whole waveform.
+ *
+ * Frame spectra go into a ring of exactly SS_T slots. Segment k covers global
+ * frames [k*hop, k*hop + SS_T) -- the whole ring -- and retires frames
+ * [k*hop, (k+1)*hop), whose slots are precisely the ones segment k+1's new
+ * frames overwrite. So the ring is never short and never has to grow.
+ *
+ * A retired frame's mask multiplies the ORIGINAL COMPLEX mixture spectrum
+ * stored in that ring slot (step 7): the mixture's phase is reused unchanged
+ * and never reconstructed.
  */
 
-/* Processes one hop's worth of newly staged samples (already sitting in
- * s->pt_stage, full for the normal path, zero-padded by the caller for the
- * EOF flush): emits the now-final front hop of ola_buf, then slides both
- * the analysis window and ola_buf forward and folds in the new frame.
- * `is_flush` caps emission at s->pt_total_in so tail zero-padding never
- * leaks into the output. */
-static int ss_pt_process_hop(AVFilterContext *ctx, int is_flush)
+static int ss_emit_frames(AVFilterContext *ctx, int nb_frames);
+
+/* Runs one segment: gathers its magnitude out of the ring, infers, builds the
+ * ratio masks, blends them with any overlapping neighbour, and retires the
+ * frames the next segment will overwrite. */
+static int ss_process_segment(AVFilterContext *ctx)
 {
     StemSplitContext *s = ctx->priv;
-    AVFilterLink *outlink = ctx->outputs[0];
-    int skip = 0, to_emit;
-    int ret;
+    const int64_t base = s->next_segment * s->hop_frames;
+    const float *est_p[SS_NB_INSTRUMENTS];
+    int c, j, f, i, ret;
 
-    /* Fold the newly staged hop into the sliding analysis window. */
-    for (int c = 0; c < SS_CHANNELS; c++) {
-        memmove(s->pt_window[c], s->pt_window[c] + SS_FRAME_STEP,
-                (SS_FRAME_LENGTH - SS_FRAME_STEP) * sizeof(float));
-        memcpy(s->pt_window[c] + SS_FRAME_LENGTH - SS_FRAME_STEP, s->pt_stage[c],
-               SS_FRAME_STEP * sizeof(float));
+    for (c = 0; c < SS_CHANNELS; c++)
+        for (j = 0; j < SS_T; j++) {
+            const AVComplexFloat *row = s->spec_ring +
+                ((size_t) ((base + j) % SS_T) * SS_CHANNELS + c) * SS_SPEC_STRIDE;
+            float *dst = s->mag + ss_nidx(c, j, 0);
+
+            /* Raw magnitude, no normalisation -- design 4.2 step 3. */
+            for (f = 0; f < SS_F; f++)
+                dst[f] = hypotf(row[f].re, row[f].im);
+        }
+
+    for (i = 0; i < SS_NB_INSTRUMENTS; i++)
+        est_p[i] = s->est[i];
+
+    ret = ss_infer(ctx, s->mag, s->est);
+    if (ret < 0)
+        return ret;
+
+    ss_build_masks(s, est_p, s->mask);
+
+    if (s->overlap_frames > 0) {
+        int64_t t;
+
+        /* Slots this segment is the first to touch start from zero; the rest
+         * already carry the previous segment's weighted contribution. */
+        for (t = FFMAX(base, s->acc_filled); t < base + SS_T; t++) {
+            const int slot = (int) (t % SS_T);
+
+            s->w_acc[slot] = 0.0f;
+            for (i = 0; i < s->nb_instruments; i++)
+                for (c = 0; c < SS_CHANNELS; c++)
+                    memset(s->mask_acc[i] + ss_idx(c, slot, 0), 0,
+                           SS_BINS * sizeof(float));
+        }
+        s->acc_filled = base + SS_T;
+
+        for (j = 0; j < SS_T; j++) {
+            const int slot = (int) ((base + j) % SS_T);
+            const float v = s->seg_win[j];
+
+            s->w_acc[slot] += v;
+            for (i = 0; i < s->nb_instruments; i++)
+                for (c = 0; c < SS_CHANNELS; c++) {
+                    const float *src = s->mask[i] + ss_idx(c, j, 0);
+                    float *dst = s->mask_acc[i] + ss_idx(c, slot, 0);
+
+                    for (f = 0; f < SS_BINS; f++)
+                        dst[f] += v * src[f];
+                }
+        }
     }
 
-    /* The front hop of ola_buf can no longer be touched by any future frame
-     * (the next frame's window starts one hop later): pull it out before
-     * shifting ola_buf to make room for the new frame. */
-    if (s->pt_crop_remaining > 0) {
-        skip = (int) FFMIN(s->pt_crop_remaining, SS_FRAME_STEP);
-        s->pt_crop_remaining -= skip;
-    }
-    to_emit = SS_FRAME_STEP - skip;
-    if (is_flush)
-        to_emit = (int) FFMIN(to_emit, FFMAX(s->pt_total_in - s->pt_emitted, 0));
+    s->next_segment++;
+
+    return ss_emit_frames(ctx, (int) (base + s->hop_frames - s->frames_done));
+}
+
+/* Retires nb_frames frames: masks each one's mixture spectrum, resynthesises
+ * it into every output pad's overlap-add accumulator, and pushes the samples
+ * that no future frame can still touch.
+ *
+ * A sample s takes contributions from every frame t with
+ * t*STEP <= s < t*STEP + LENGTH, so once frame t has been added, everything
+ * below (t+1)*STEP is final: exactly one hop per frame, which is why the
+ * accumulator only needs to be one frame long. */
+static int ss_emit_frames(AVFilterContext *ctx, int nb_frames)
+{
+    StemSplitContext *s = ctx->priv;
+    const int64_t total = (int64_t) nb_frames * SS_FRAME_STEP;
+    AVFrame *out[SS_NB_INSTRUMENTS] = { NULL };
+    int64_t skip, to_emit, written = 0, pts;
+    int j, c, fi, b, ret = 0;
+
+    if (nb_frames <= 0)
+        return 0;
+
+    /* out[] and s->ola[] are sized by instrument count; one pad per instrument
+     * is the maximum ss_append_outputs can produce. */
+    av_assert0(ctx->nb_outputs <= SS_NB_INSTRUMENTS);
+
+    /* Step 9's crop: drop the lead-in the analysis window prepended. */
+    skip = FFMIN(s->crop_remaining, total);
+    s->crop_remaining -= skip;
+    to_emit = total - skip;
+
+    /* At EOF the last segment was zero-padded to a full SS_T frames; the pad
+     * must not reach the output, so the true sample count caps it. */
+    if (s->flushing)
+        to_emit = FFMIN(to_emit, FFMAX(s->total_in - s->emitted, 0));
 
     if (to_emit > 0) {
-        AVFrame *out = ff_get_audio_buffer(outlink, to_emit);
-        if (!out)
-            return AVERROR(ENOMEM);
-        for (int c = 0; c < SS_CHANNELS; c++)
-            memcpy(out->extended_data[c], s->ola_buf + c * SS_FRAME_LENGTH + skip,
-                   to_emit * sizeof(float));
+        for (j = 0; j < ctx->nb_outputs; j++) {
+            if (ff_outlink_get_status(ctx->outputs[j]))
+                continue;   /* downstream is gone; keep processing, drop output */
+            out[j] = ff_get_audio_buffer(ctx->outputs[j], (int) to_emit);
+            if (!out[j]) {
+                ret = AVERROR(ENOMEM);
+                goto fail;
+            }
+        }
+    }
 
-        out->pts = s->next_pts;
-        if (s->next_pts != AV_NOPTS_VALUE)
-            s->next_pts += av_rescale_q(to_emit, (AVRational) { 1, outlink->sample_rate },
-                                         outlink->time_base);
-        s->pt_emitted += to_emit;
+    for (fi = 0; fi < nb_frames; fi++) {
+        const int slot = (int) (s->frames_done % SS_T);
+        const float inv_w = s->overlap_frames > 0 ? 1.0f / s->w_acc[slot] : 1.0f;
+        int64_t dst = written - skip;
+        int src_off = 0, n = SS_FRAME_STEP;
 
-        ret = ff_filter_frame(outlink, out);
+        for (j = 0; j < ctx->nb_outputs; j++) {
+            const int inst = s->out_inst[j];
+            const float *m_base = s->overlap_frames > 0 ? s->mask_acc[inst]
+                                                         : s->mask[inst];
+
+            for (c = 0; c < SS_CHANNELS; c++) {
+                const AVComplexFloat *spec = s->spec_ring +
+                    ((size_t) slot * SS_CHANNELS + c) * SS_SPEC_STRIDE;
+                const float *m = m_base + ss_idx(c, slot, 0);
+
+                for (b = 0; b < SS_BINS; b++) {
+                    const float gain = m[b] * inv_w;
+
+                    s->work_spec[b].re = spec[b].re * gain;
+                    s->work_spec[b].im = spec[b].im * gain;
+                }
+                ss_synthesize(s, s->work_spec, s->ola[j][c], 0);
+            }
+        }
+
+        if (dst < 0) {
+            src_off = (int) FFMIN(-dst, (int64_t) SS_FRAME_STEP);
+            n      -= src_off;
+            dst     = 0;
+        }
+        if (n > 0 && dst < to_emit) {
+            n = (int) FFMIN((int64_t) n, to_emit - dst);
+            for (j = 0; j < ctx->nb_outputs; j++) {
+                if (!out[j])
+                    continue;
+                for (c = 0; c < SS_CHANNELS; c++)
+                    memcpy((float *) out[j]->extended_data[c] + dst,
+                           s->ola[j][c] + src_off, n * sizeof(float));
+            }
+        }
+
+        for (j = 0; j < ctx->nb_outputs; j++)
+            for (c = 0; c < SS_CHANNELS; c++) {
+                float *o = s->ola[j][c];
+
+                memmove(o, o + SS_FRAME_STEP,
+                        (SS_FRAME_LENGTH - SS_FRAME_STEP) * sizeof(float));
+                memset(o + SS_FRAME_LENGTH - SS_FRAME_STEP, 0,
+                       SS_FRAME_STEP * sizeof(float));
+            }
+
+        written += SS_FRAME_STEP;
+        s->frames_done++;
+    }
+
+    if (to_emit <= 0)
+        return 0;
+
+    pts = s->next_pts;
+    if (s->next_pts != AV_NOPTS_VALUE)
+        s->next_pts += av_rescale_q(to_emit, (AVRational) { 1, SS_SAMPLE_RATE },
+                                    ctx->outputs[0]->time_base);
+    s->emitted += to_emit;
+
+    for (j = 0; j < ctx->nb_outputs; j++) {
+        AVFrame *frame = out[j];
+
+        if (!frame)
+            continue;
+        out[j] = NULL;
+        frame->pts = pts;
+        ret = ff_filter_frame(ctx->outputs[j], frame);
         if (ret < 0)
-            return ret;
+            goto fail;
     }
 
-    /* Shift ola_buf by one hop and add the new frame's contribution into
-     * the freshly-vacated tail. */
-    for (int c = 0; c < SS_CHANNELS; c++) {
-        float *ola = s->ola_buf + c * SS_FRAME_LENGTH;
+    return 0;
 
-        memmove(ola, ola + SS_FRAME_STEP, (SS_FRAME_LENGTH - SS_FRAME_STEP) * sizeof(float));
-        memset(ola + SS_FRAME_LENGTH - SS_FRAME_STEP, 0, SS_FRAME_STEP * sizeof(float));
+fail:
+    for (j = 0; j < SS_NB_INSTRUMENTS; j++)
+        av_frame_free(&out[j]);
+    return ret;
+}
 
-        ss_analyze(s, s->pt_window[c], s->pt_spec);
-        ss_synthesize(s, s->pt_spec, ola, 0);
-    }
+/* Analyses the current window into the ring and runs a segment if that
+ * completed one. */
+static int ss_push_frame(AVFilterContext *ctx)
+{
+    StemSplitContext *s = ctx->priv;
+    const int slot = (int) (s->frames_in % SS_T);
+    int c;
+
+    for (c = 0; c < SS_CHANNELS; c++)
+        ss_analyze(s, s->an_window[c],
+                   s->spec_ring + ((size_t) slot * SS_CHANNELS + c) * SS_SPEC_STRIDE);
+    s->frames_in++;
+
+    /* Run before the next frame can overwrite a slot this segment still
+     * needs: segment k's last frame arriving is exactly the moment its first
+     * frame's slot becomes the next segment's target. */
+    if (s->frames_in >= s->next_segment * s->hop_frames + SS_T)
+        return ss_process_segment(ctx);
 
     return 0;
 }
 
-static int ss_passthrough_push(AVFilterContext *ctx, AVFrame *frame)
+/* Slides the analysis window by one hop, folding in whatever is staged. */
+static int ss_push_hop(AVFilterContext *ctx)
 {
     StemSplitContext *s = ctx->priv;
-    int offset = 0;
+    int c;
 
-    s->pt_total_in += frame->nb_samples;
+    for (c = 0; c < SS_CHANNELS; c++) {
+        memmove(s->an_window[c], s->an_window[c] + SS_FRAME_STEP,
+                (SS_FRAME_LENGTH - SS_FRAME_STEP) * sizeof(float));
+        memcpy(s->an_window[c] + SS_FRAME_LENGTH - SS_FRAME_STEP,
+               s->an_stage[c], SS_FRAME_STEP * sizeof(float));
+    }
+    s->an_stage_fill = 0;
+
+    return ss_push_frame(ctx);
+}
+
+/* Emits the lead-in frame: the all-zero analysis window, which is frame 0 of
+ * the zero-prepended signal. Skipping it would shift every segment one frame
+ * against the reference for no gain -- it costs one FFT of silence. */
+static int ss_driver_start(AVFilterContext *ctx)
+{
+    StemSplitContext *s = ctx->priv;
+
+    if (s->started)
+        return 0;
+    s->started = 1;
+
+    return ss_push_frame(ctx);
+}
+
+static int ss_push_samples(AVFilterContext *ctx, const AVFrame *frame)
+{
+    StemSplitContext *s = ctx->priv;
+    int offset = 0, ret;
+
+    ret = ss_driver_start(ctx);
+    if (ret < 0)
+        return ret;
+
+    s->total_in += frame->nb_samples;
 
     while (offset < frame->nb_samples) {
-        int n = FFMIN(frame->nb_samples - offset, SS_FRAME_STEP - s->pt_stage_fill);
+        const int n = FFMIN(frame->nb_samples - offset,
+                            SS_FRAME_STEP - s->an_stage_fill);
+        int c;
 
-        for (int c = 0; c < SS_CHANNELS; c++)
-            memcpy(s->pt_stage[c] + s->pt_stage_fill,
+        for (c = 0; c < SS_CHANNELS; c++)
+            memcpy(s->an_stage[c] + s->an_stage_fill,
                    (const float *) frame->extended_data[c] + offset,
                    n * sizeof(float));
-        s->pt_stage_fill += n;
+        s->an_stage_fill += n;
         offset += n;
 
-        if (s->pt_stage_fill == SS_FRAME_STEP) {
-            int ret = ss_pt_process_hop(ctx, 0);
+        if (s->an_stage_fill == SS_FRAME_STEP) {
+            ret = ss_push_hop(ctx);
             if (ret < 0)
                 return ret;
-            s->pt_stage_fill = 0;
         }
     }
 
     return 0;
 }
 
-static int ss_passthrough_flush(AVFilterContext *ctx)
+/* EOF drain. Keeps feeding zeros -- pad_end for the tail frames, and the time
+ * axis zero-padded to a whole segment for the network -- until every real
+ * input sample has come back out. ss_emit_frames caps the output at
+ * total_in while s->flushing is set, so the padding never reaches the file. */
+static int ss_flush(AVFilterContext *ctx)
 {
     StemSplitContext *s = ctx->priv;
+    int ret;
 
-    /* Keep zero-padding and sliding the window (exactly the pad_end tail
-     * behaviour of the design's forward pipeline) until every real sample
-     * has been overlap-added and emitted. */
-    for (;;) {
-        int ret;
+    ret = ss_driver_start(ctx);
+    if (ret < 0)
+        return ret;
 
-        for (int c = 0; c < SS_CHANNELS; c++)
-            memset(s->pt_stage[c] + s->pt_stage_fill, 0,
-                   (SS_FRAME_STEP - s->pt_stage_fill) * sizeof(float));
+    s->flushing = 1;
 
-        ret = ss_pt_process_hop(ctx, 1);
+    while (s->emitted < s->total_in) {
+        int c;
+
+        for (c = 0; c < SS_CHANNELS; c++)
+            memset(s->an_stage[c] + s->an_stage_fill, 0,
+                   (SS_FRAME_STEP - s->an_stage_fill) * sizeof(float));
+
+        ret = ss_push_hop(ctx);
         if (ret < 0)
             return ret;
-        s->pt_stage_fill = 0;
+    }
 
-        if (s->pt_emitted >= s->pt_total_in)
-            break;
+    return 0;
+}
+
+static void ss_driver_free(StemSplitContext *s)
+{
+    int c, i;
+
+    for (c = 0; c < SS_CHANNELS; c++) {
+        av_freep(&s->an_window[c]);
+        av_freep(&s->an_stage[c]);
+    }
+    for (i = 0; i < SS_NB_INSTRUMENTS; i++) {
+        av_freep(&s->est[i]);
+        av_freep(&s->mask[i]);
+        av_freep(&s->mask_acc[i]);
+        for (c = 0; c < SS_CHANNELS; c++)
+            av_freep(&s->ola[i][c]);
+    }
+    av_freep(&s->spec_ring);
+    av_freep(&s->mag);
+    av_freep(&s->w_acc);
+    av_freep(&s->seg_win);
+    av_freep(&s->work_spec);
+}
+
+static int ss_driver_init(AVFilterContext *ctx)
+{
+    StemSplitContext *s = ctx->priv;
+    const size_t net_floats = (size_t) SS_CHANNELS * SS_T * SS_F;
+    const size_t mask_floats = (size_t) SS_CHANNELS * SS_T * SS_BINS;
+    int c, i, j;
+
+    /* Ruling 11: `overlap` is a duration, because a user should not have to
+     * know that a segment is 512 STFT frames of 1024 samples to ask for a
+     * second and a half of crossfade. The conversion lives here, where the
+     * arithmetic is. */
+    s->overlap_frames = (int) av_clip64(av_rescale(s->overlap, SS_SAMPLE_RATE,
+                                                   AV_TIME_BASE) / SS_FRAME_STEP,
+                                        0, SS_T - 1);
+    s->hop_frames = SS_T - s->overlap_frames;
+
+    for (c = 0; c < SS_CHANNELS; c++) {
+        s->an_window[c] = av_calloc(SS_FRAME_LENGTH, sizeof(float));
+        s->an_stage[c]  = av_calloc(SS_FRAME_STEP, sizeof(float));
+        if (!s->an_window[c] || !s->an_stage[c])
+            return AVERROR(ENOMEM);
+    }
+
+    s->spec_ring = av_calloc((size_t) SS_T * SS_CHANNELS * SS_SPEC_STRIDE,
+                             sizeof(*s->spec_ring));
+    s->mag       = av_calloc(net_floats, sizeof(float));
+    s->work_spec = av_calloc(SS_BINS, sizeof(*s->work_spec));
+    s->seg_win   = av_calloc(SS_T, sizeof(float));
+    if (!s->spec_ring || !s->mag || !s->work_spec || !s->seg_win)
+        return AVERROR(ENOMEM);
+
+    for (i = 0; i < s->nb_instruments; i++) {
+        s->est[i]  = av_calloc(net_floats, sizeof(float));
+        s->mask[i] = av_calloc(mask_floats, sizeof(float));
+        if (!s->est[i] || !s->mask[i])
+            return AVERROR(ENOMEM);
+    }
+
+    for (j = 0; j < s->nb_outputs; j++)
+        for (c = 0; c < SS_CHANNELS; c++) {
+            s->ola[j][c] = av_calloc(SS_FRAME_LENGTH, sizeof(float));
+            if (!s->ola[j][c])
+                return AVERROR(ENOMEM);
+        }
+
+    /* Per-frame taper inside a segment. Zero overlap means a flat window and
+     * no accumulator at all, which is both the default and the reference
+     * behaviour. With overlap, the taper rises over the first overlap_frames
+     * and falls over the last, and the sum of tapers normalises it -- so the
+     * very first and very last segments, which have no neighbour to blend
+     * with, come back out at unit gain automatically.
+     *
+     * The weights are EQUAL-GAIN (they sum to 1 after normalisation), not
+     * equal-power. Both segments carry the same mixture phase -- they differ
+     * only in a real, non-negative mask -- so their outputs add coherently and
+     * sqrt weights would put a +3 dB hump in the middle of every crossfade.
+     * Equal power is the right rule for uncorrelated material; this is the
+     * opposite case. */
+    for (j = 0; j < SS_T; j++) {
+        float v = 1.0f;
+
+        if (s->overlap_frames > 0) {
+            const float d = s->overlap_frames + 1.0f;
+
+            if (j < s->overlap_frames)
+                v = (j + 1) / d;
+            if (j >= SS_T - s->overlap_frames)
+                v = FFMIN(v, (SS_T - j) / d);
+        }
+        s->seg_win[j] = v;
+    }
+
+    if (s->overlap_frames > 0) {
+        s->w_acc = av_calloc(SS_T, sizeof(float));
+        if (!s->w_acc)
+            return AVERROR(ENOMEM);
+        for (i = 0; i < s->nb_instruments; i++) {
+            s->mask_acc[i] = av_calloc(mask_floats, sizeof(float));
+            if (!s->mask_acc[i])
+                return AVERROR(ENOMEM);
+        }
+    }
+
+    s->crop_remaining = SS_FRAME_LENGTH;
+
+    /* The clamp is [0, SS_T-1] per Ruling 11, so a user can ask for an overlap
+     * of nearly a whole segment -- and pay for it, because the cost is exactly
+     * SS_T / hop_frames forward passes per segment of audio. Say so rather
+     * than let it look like a hang. */
+    if (s->hop_frames * 4 < SS_T)
+        av_log(ctx, AV_LOG_WARNING,
+               "stemsplit: overlap advances only %d of %d frames per segment, "
+               "so the network runs %.0fx as often as at overlap=0. Expect a "
+               "proportional slowdown.\n",
+               s->hop_frames, SS_T, SS_T / (double) s->hop_frames);
+
+    av_log(ctx, AV_LOG_VERBOSE,
+           "stemsplit: segment %d frames (%.3f s), advance %d frames, "
+           "overlap %d frames, %d output pad(s).\n",
+           SS_T, (double) SS_T * SS_FRAME_STEP / SS_SAMPLE_RATE,
+           s->hop_frames, s->overlap_frames, s->nb_outputs);
+
+    return 0;
+}
+
+/* ---- Filter plumbing ----------------------------------------------------- */
+
+/* Index of `name` in the model's instrument list, or a negative error. The
+ * caller has already been validated by ss_model_load, so a miss here is an
+ * internal inconsistency rather than a user error. */
+static int ss_find_instrument(const StemSplitContext *s, const char *name)
+{
+    int i;
+
+    for (i = 0; i < s->nb_instruments; i++)
+        if (!strcmp(s->instrument_names[i], name))
+            return i;
+
+    return AVERROR(EINVAL);
+}
+
+/* stem=all exposes one output pad per instrument, named after the model's own
+ * instrument list, which is the af_channelsplit pattern and the reason the
+ * filter carries AVFILTER_FLAG_DYNAMIC_OUTPUTS. stem=<name> exposes a single
+ * pad called "default": the ffmpeg CLI treats an unconnected filter output as
+ * an error, so the single-pad form is what makes the common karaoke case work
+ * with a plain -af instead of -filter_complex. */
+static int ss_append_outputs(AVFilterContext *ctx)
+{
+    StemSplitContext *s = ctx->priv;
+    int i, ret;
+
+    if (s->stem == SS_STEM_ALL) {
+        for (i = 0; i < s->nb_instruments; i++) {
+            AVFilterPad pad = { .type = AVMEDIA_TYPE_AUDIO };
+
+            pad.name = av_strdup(s->instrument_names[i]);
+            if (!pad.name)
+                return AVERROR(ENOMEM);
+            /* _free_name so the strdup is released even if the append fails. */
+            ret = ff_append_outpad_free_name(ctx, &pad);
+            if (ret < 0)
+                return ret;
+            s->out_inst[i] = i;
+        }
+        s->nb_outputs = s->nb_instruments;
+    } else {
+        AVFilterPad pad = { .name = "default", .type = AVMEDIA_TYPE_AUDIO };
+        const char *want = s->stem == SS_STEM_VOCALS ? "vocals" : "accompaniment";
+
+        ret = ss_find_instrument(s, want);
+        if (ret < 0)
+            return ret;
+        s->out_inst[0] = ret;
+        s->nb_outputs = 1;
+
+        ret = ff_append_outpad(ctx, &pad);
+        if (ret < 0)
+            return ret;
     }
 
     return 0;
@@ -1473,49 +2087,38 @@ static av_cold int init(AVFilterContext *ctx)
     StemSplitContext *s = ctx->priv;
     int ret;
 
-    /* Ruling 2: model loading is skippable so passthrough_dsp's round-trip
-     * test (Task 5) keeps working with no model at all. ss_model_load()
-     * does its own "no model given" check for the real (non-passthrough)
-     * path -- see design section 10, row 1. */
-    if (!s->passthrough_dsp) {
-        ret = ss_model_load(ctx);
-        if (ret < 0)
-            return ret;
-    }
-
-    /* Internal parity path (design section 9.2): when `debug_input` names a
-     * raw spectrogram, run the network on it once here and dump the taps the
-     * fixtures record, bypassing the STFT entirely. */
-    if (!s->passthrough_dsp && s->debug_input_path && *s->debug_input_path) {
-        ret = ss_run_debug_input(ctx);
-        if (ret < 0)
-            return ret;
-    }
-
     s->next_pts = AV_NOPTS_VALUE;
+
+    ret = ss_model_load(ctx);
+    if (ret < 0)
+        return ret;
+
+    ret = ss_append_outputs(ctx);
+    if (ret < 0)
+        return ret;
 
     ret = ss_dsp_init(ctx);
     if (ret < 0)
         return ret;
 
-    for (int c = 0; c < SS_CHANNELS; c++) {
-        s->pt_window[c] = av_calloc(SS_FRAME_LENGTH, sizeof(*s->pt_window[c]));
-        s->pt_stage[c]  = av_calloc(SS_FRAME_STEP, sizeof(*s->pt_stage[c]));
-        if (!s->pt_window[c] || !s->pt_stage[c])
-            return AVERROR(ENOMEM);
-    }
-    s->pt_spec = av_malloc_array(SS_BINS, sizeof(*s->pt_spec));
-    if (!s->pt_spec)
-        return AVERROR(ENOMEM);
-    s->pt_crop_remaining = SS_FRAME_LENGTH;
+    /* Internal parity path (design section 9.2): when `debug_input` names a
+     * raw spectrogram, run the networks on it once here and dump the taps the
+     * fixtures record, bypassing the STFT and the segment driver entirely.
+     * The driver's buffers are not allocated on this path and audio is passed
+     * through untouched -- this hook exists to measure the network, not to
+     * separate anything. */
+    if (s->debug_input_path && *s->debug_input_path)
+        return ss_run_debug_input(ctx);
 
-    return 0;
+    return ss_driver_init(ctx);
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
     StemSplitContext *s = ctx->priv;
 
+    /* Before ss_model_free: every graph tensor's weights live in gguf_ctx. */
+    ss_graph_free(s);
     ss_model_free(s);
 
     /* ggml_log_set() is process-global, not per-context: ss_model_load()
@@ -1532,73 +2135,73 @@ static av_cold void uninit(AVFilterContext *ctx)
     ggml_log_set(NULL, NULL);
 
     ss_dsp_free(s);
-    for (int c = 0; c < SS_CHANNELS; c++) {
-        av_freep(&s->pt_window[c]);
-        av_freep(&s->pt_stage[c]);
-    }
-    av_freep(&s->pt_spec);
+    ss_driver_free(s);
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
+static int ss_filter_frame(AVFilterContext *ctx, AVFrame *frame)
 {
-    AVFilterContext *ctx = inlink->dst;
     StemSplitContext *s = ctx->priv;
-    AVFilterLink *outlink = ctx->outputs[0];
+    int ret;
 
-    if (s->passthrough_dsp) {
-        int ret;
+    if (s->next_pts == AV_NOPTS_VALUE)
+        s->next_pts = frame->pts != AV_NOPTS_VALUE ? frame->pts : 0;
 
-        if (s->next_pts == AV_NOPTS_VALUE)
-            s->next_pts = frame->pts != AV_NOPTS_VALUE ? frame->pts : 0;
+    /* Parity hook: the network has already been measured against the injected
+     * spectrogram in init(); the audio itself is of no interest. */
+    if (s->debug_input_path && *s->debug_input_path)
+        return ff_filter_frame(ctx->outputs[0], frame);
 
-        ret = ss_passthrough_push(ctx, frame);
-        av_frame_free(&frame);
-        return ret;
-    }
+    ret = ss_push_samples(ctx, frame);
+    av_frame_free(&frame);
 
-    /* Skeleton: forward the frame unchanged. No STFT, no separation. */
-    s->next_pts = frame->pts + av_rescale_q(frame->nb_samples,
-                                            (AVRational) { 1, inlink->sample_rate },
-                                            inlink->time_base);
-    return ff_filter_frame(outlink, frame);
+    return ret;
 }
 
 static int activate(AVFilterContext *ctx)
 {
     AVFilterLink *inlink = ctx->inputs[0];
-    AVFilterLink *outlink = ctx->outputs[0];
     StemSplitContext *s = ctx->priv;
+    AVFrame *in = NULL;
     int64_t pts;
-    int status;
+    int i, status, ret, nb_eofs = 0;
 
-    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+    /* Every output gone means nobody is listening: tell the input to stop
+     * rather than keep paying for 11.9 s segments nothing will read. */
+    for (i = 0; i < ctx->nb_outputs; i++)
+        nb_eofs += ff_outlink_get_status(ctx->outputs[i]) == AVERROR_EOF;
+    if (nb_eofs == ctx->nb_outputs) {
+        ff_inlink_set_status(inlink, AVERROR_EOF);
+        return 0;
+    }
 
-    if (!s->eof && ff_inlink_queued_frames(inlink)) {
-        AVFrame *frame = NULL;
-        int ret;
-
-        ret = ff_inlink_consume_frame(inlink, &frame);
+    if (!s->eof) {
+        ret = ff_inlink_consume_frame(inlink, &in);
         if (ret < 0)
             return ret;
         if (ret > 0)
-            return filter_frame(inlink, frame);
+            return ss_filter_frame(ctx, in);
     }
 
     if (!s->eof && ff_inlink_acknowledge_status(inlink, &status, &pts)) {
-        s->eof = status == AVERROR_EOF;
-        if (s->eof && s->passthrough_dsp) {
-            int ret = ss_passthrough_flush(ctx);
+        s->eof    = 1;
+        s->status = status;
+        if (status == AVERROR_EOF && !(s->debug_input_path && *s->debug_input_path)) {
+            ret = ss_flush(ctx);
             if (ret < 0)
                 return ret;
         }
     }
 
     if (s->eof) {
-        ff_outlink_set_status(outlink, AVERROR_EOF, s->next_pts);
+        for (i = 0; i < ctx->nb_outputs; i++) {
+            if (ff_outlink_get_status(ctx->outputs[i]))
+                continue;
+            ff_outlink_set_status(ctx->outputs[i], s->status, s->next_pts);
+        }
         return 0;
     }
 
-    FF_FILTER_FORWARD_WANTED(outlink, inlink);
+    FF_FILTER_FORWARD_WANTED_ANY(ctx, inlink);
 
     return FFERROR_NOT_READY;
 }
@@ -1613,18 +2216,15 @@ static const AVOption stemsplit_options[] = {
         { "accompaniment", "accompaniment stem only", 0, AV_OPT_TYPE_CONST, { .i64 = SS_STEM_ACCOMPANIMENT }, 0, 0, FLAGS, .unit = "stem" },
         { "all", "both stems, one per output pad", 0, AV_OPT_TYPE_CONST, { .i64 = SS_STEM_ALL }, 0, 0, FLAGS, .unit = "stem" },
     { "highband", "how to reconstruct frequencies above the network's band", OFFSET(highband), AV_OPT_TYPE_INT, { .i64 = SS_HB_PASSTHROUGH }, 0, SS_HB_AVERAGE, FLAGS, .unit = "highband" },
-        { "passthrough", "copy the input high band unchanged", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_PASSTHROUGH }, 0, 0, FLAGS, .unit = "highband" },
-        { "zeros", "silence the high band", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_ZEROS }, 0, 0, FLAGS, .unit = "highband" },
-        { "average", "split the high band evenly between stems", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_AVERAGE }, 0, 0, FLAGS, .unit = "highband" },
+        { "passthrough", "route the input high band into the last stem", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_PASSTHROUGH }, 0, 0, FLAGS, .unit = "highband" },
+        { "zeros", "silence the high band in every stem (upstream Spleeter)", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_ZEROS }, 0, 0, FLAGS, .unit = "highband" },
+        { "average", "tile each frame's mean mask across the high band", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_AVERAGE }, 0, 0, FLAGS, .unit = "highband" },
     { "overlap", "segment overlap as a duration, crossfaded on output", OFFSET(overlap), AV_OPT_TYPE_DURATION, { .i64 = 0 }, 0, 60000000, FLAGS },
     { "threads", "number of ggml threads", OFFSET(nb_threads), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS },
     { "dump", "Internal: directory to dump intermediate tensors to for parity testing; empty disables", OFFSET(dump_dir), AV_OPT_TYPE_STRING, { .str = "" }, .flags = FLAGS },
     { "debug_input", "Internal: raw [C][T][F] float32 spectrogram to inject as the "
                      "network input, bypassing the STFT",
       OFFSET(debug_input_path), AV_OPT_TYPE_STRING, {.str = ""}, .flags = FLAGS },
-    { "passthrough_dsp", "Internal: run STFT analysis and synthesis with no mask, "
-                         "for round-trip testing",
-      OFFSET(passthrough_dsp), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { NULL }
 };
 
@@ -1634,11 +2234,12 @@ const FFFilter ff_af_stemsplit = {
     .p.name        = "stemsplit",
     .p.description = NULL_IF_CONFIG_SMALL("Separate music into vocal and accompaniment stems."),
     .p.priv_class  = &stemsplit_class,
+    /* Output pads are appended in init(); there is no FILTER_OUTPUTS. */
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_OUTPUTS,
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
     .priv_size     = sizeof(StemSplitContext),
     FILTER_INPUTS(ff_audio_default_filterpad),
-    FILTER_OUTPUTS(ff_audio_default_filterpad),
     FILTER_QUERY_FUNC2(query_formats),
 };
