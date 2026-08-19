@@ -360,6 +360,25 @@ stopping before FFmpeg's own build so the configured source tree survives).
   tensor — a later task may use it to simplify that emulation, but this task
   makes no implementation change; it only confirms the op is available.
 
+#### 6.3.2 GGUF stores conv kernels axis-reversed from what ggml's conv ops need
+
+Found during Task 7; recorded because no upstream document states it and the
+symptom is a plausible-looking wrong answer rather than an error.
+
+The converter builds each kernel as a numpy array shaped `(kw, kh, ic, oc)` and
+hands it to `GGUFWriter`, which writes numpy shapes **reversed** into ggml's `ne`.
+The stored tensor therefore arrives as `ne = [oc, ic, kh, kw]`. But `ggml_conv_2d`
+expects `ne = [KW, KH, IC, OC]` — the exact reverse.
+
+The loader adapts once, at load time, via `ss_repack_kernel`, applied uniformly to
+all 26 conv kernels so the compute graph sees a consistent model.
+
+This is deliberately fixed in the loader rather than the converter. Adapting
+storage layout to compute layout on load is the ordinary ggml-loader pattern; it
+costs a single pass over roughly 20 MB, once. Moving it into the converter would
+change the on-disk layout and ripple into both the converter's verified
+100-tensor contract and the loader's shape validation, for no runtime gain.
+
 ### 6.4 Unit 4 — build integration (`scripts/60-stemsplit.sh`)
 
 Follows `scripts/57-keydetect.sh` verbatim in structure:
@@ -439,6 +458,23 @@ For the fixed reference segment emitted by the converter, compare all 13 layer
 outputs per network against the Python reference at `rtol=1e-3`. This is the
 safety net for the padding-crop arithmetic in section 6.3 and must pass before any
 subjective listening.
+
+**The reference must be generated at the shipped precision.** The Python
+reference rounds each convolution kernel through float16 and back
+(`kernel.astype(np.float16).astype(np.float32)`) before loading it into Keras,
+mirroring what the converter writes. Biases and BatchNorm affine terms are F32 in
+the artifact and stay F32 in the reference.
+
+This coupling is load-bearing and was learned the hard way. A reference built from
+the full-precision checkpoint disagrees with the shipped fp16 model by 1e-3 to
+9e-3 relative — enough to fail every layer at `rtol=1e-3` while the graph itself
+is exactly correct. Generated at matching precision, the same graph agrees to
+1.6e-5 at `conv1` and 1.1e-4 at `conv6`.
+
+The consequence: **if the artifact's precision ever changes, these fixtures must be
+regenerated.** Testing against weights the runtime never sees measures a
+deliberate precision choice rather than a correctness difference, and the whole
+value of this gate is that it measures only the latter.
 
 ### 9.3 End-to-end separation
 A synthetic mix — low sine (bass), band-limited noise (percussion), and a
