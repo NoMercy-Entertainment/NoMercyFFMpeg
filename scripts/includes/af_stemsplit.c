@@ -64,7 +64,6 @@ typedef struct StemSplitContext {
     int64_t  overlap;
     int      nb_threads;
     char    *dump_dir;
-    int      dump;
     char    *debug_input_path;
 
     int      eof;
@@ -159,7 +158,7 @@ static int activate(AVFilterContext *ctx)
 
 static const AVOption stemsplit_options[] = {
     { "model", "Path to the stemsplit GGUF model file", OFFSET(model_path), AV_OPT_TYPE_STRING, .flags = FLAGS },
-    { "stem", "Stem to output", OFFSET(stem), AV_OPT_TYPE_INT, { .i64 = SS_STEM_VOCALS }, 0, SS_STEM_ALL, FLAGS, .unit = "stem" },
+    { "stem", "Stem to output", OFFSET(stem), AV_OPT_TYPE_INT, { .i64 = SS_STEM_ALL }, 0, SS_STEM_ALL, FLAGS, .unit = "stem" },
         { "vocals", "vocal stem only", 0, AV_OPT_TYPE_CONST, { .i64 = SS_STEM_VOCALS }, 0, 0, FLAGS, .unit = "stem" },
         { "accompaniment", "accompaniment stem only", 0, AV_OPT_TYPE_CONST, { .i64 = SS_STEM_ACCOMPANIMENT }, 0, 0, FLAGS, .unit = "stem" },
         { "all", "both stems, one per output pad", 0, AV_OPT_TYPE_CONST, { .i64 = SS_STEM_ALL }, 0, 0, FLAGS, .unit = "stem" },
@@ -167,10 +166,9 @@ static const AVOption stemsplit_options[] = {
         { "passthrough", "copy the input high band unchanged", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_PASSTHROUGH }, 0, 0, FLAGS, .unit = "highband" },
         { "zeros", "silence the high band", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_ZEROS }, 0, 0, FLAGS, .unit = "highband" },
         { "average", "split the high band evenly between stems", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_AVERAGE }, 0, 0, FLAGS, .unit = "highband" },
-    { "overlap", "segment overlap in STFT frames, crossfaded on output", OFFSET(overlap), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, SS_T - 1, FLAGS },
+    { "overlap", "segment overlap as a duration, crossfaded on output", OFFSET(overlap), AV_OPT_TYPE_DURATION, { .i64 = 0 }, 0, 60000000, FLAGS },
     { "threads", "number of ggml threads", OFFSET(nb_threads), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS },
-    { "dump_dir", "directory to dump intermediate tensors to", OFFSET(dump_dir), AV_OPT_TYPE_STRING, { .str = "" }, .flags = FLAGS },
-    { "dump", "Internal: dump intermediate tensors to dump_dir for parity testing", OFFSET(dump), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, .flags = FLAGS },
+    { "dump", "Internal: directory to dump intermediate tensors to for parity testing; empty disables", OFFSET(dump_dir), AV_OPT_TYPE_STRING, { .str = "" }, .flags = FLAGS },
     { "debug_input", "Internal: raw [C][T][F] float32 spectrogram to inject as the "
                      "network input, bypassing the STFT",
       OFFSET(debug_input_path), AV_OPT_TYPE_STRING, {.str = ""}, .flags = FLAGS },
