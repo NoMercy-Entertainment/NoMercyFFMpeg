@@ -9,8 +9,30 @@ Produces:
   - `<raw-dir>/<inst>.<layer>.f32` (not committed): full activations, one
     file per layer, `[C][T][F]` byte order (F fastest) -- ggml's native
     memory layout for `ne = [F, T, C, 1]`.
-  - `<raw-dir>/../fixtures_input.f32` (not committed): the fixed input
-    spectrogram in the same `[C][T][F]` layout.
+  - `<raw-dir>/../fixtures_input.f32` (not committed) -- **interface
+    contract, not just a byproduct**: the fixed input magnitude
+    spectrogram every fixture in `fixtures.json` was computed from.
+    Path: the parent directory of `--raw-dir` (`os.path.dirname` of it),
+    filename `fixtures_input.f32`. Shape `[C=2][T=512][F=1024]` float32,
+    same `[C][T][F]` byte order as the layer dumps above (F fastest). A
+    later task injects this file as the network's input directly,
+    bypassing the STFT (a planned `debug_input=<path>` filter option),
+    so per-layer parity tests the network in isolation -- feeding real
+    `anoisesrc` audio through the STFT instead produces a different
+    spectrogram and cannot be compared against these fixtures.
+
+Encoder taps: `conv1..conv6` are each the RAW, pre-BatchNorm,
+pre-activation Conv2D output -- for every one of the six, not only
+`conv6`. Every skip connection in the real graph concatenates the raw
+conv (`merge1 = [conv5, drop1]` ... `merge5 = [conv1, batch11]`), never
+the activated tensor (`rel1`..`rel5`) that feeds the next encoder stage.
+A ggml implementation must keep each encoder layer's pre-BN tensor alive
+and expose it separately from the BN+LeakyReLU'd tensor used internally
+to compute the next stage -- getting this backwards is a real
+separation-quality bug in the shipped filter, not just a fixture
+mismatch. See `build_unet()` below for the full derivation, including
+the conv6 bottleneck's extra wrinkle (its BN/activation are pure dead
+code, computed but never consumed anywhere).
 
 Usage:
     python dump_reference.py --checkpoint /work/2stems \
@@ -18,7 +40,7 @@ Usage:
 
 Architecture reference: spleeter/model/functions/unet.py (Deezer, MIT
 licensed; https://github.com/deezer/spleeter). Fetched and read directly
-rather than assumed -- see the note on the conv6 bottleneck below.
+rather than assumed -- see `build_unet()` for the encoder-tap rule.
 """
 
 import argparse
@@ -53,20 +75,37 @@ def build_unet(input_tensor):
     up1-up3 in the source; it is a no-op at inference (training=False) and
     is omitted here rather than modelled as an identity layer.
 
-    The conv6 bottleneck: upstream computes
+    Skip connections use the RAW conv output, every time, not just at the
+    bottleneck. Upstream:
+        merge1 = Concatenate(axis=-1)([conv5, drop1])
+        merge2 = Concatenate(axis=-1)([conv4, drop2])
+        merge3 = Concatenate(axis=-1)([conv3, drop3])
+        merge4 = Concatenate(axis=-1)([conv2, batch10])
+        merge5 = Concatenate(axis=-1)([conv1, batch11])
+    Every one of these concatenates `conv1..conv5` -- the pre-BatchNorm,
+    pre-activation Conv2D output -- never `rel1..rel5` (the BN+LeakyReLU'd
+    tensor that feeds the *next* encoder stage). So each encoder layer has
+    two distinct consumers reading two distinct tensors: `rel_n` feeds
+    `conv_{n+1}` going down the encoder, and the separate raw `conv_n`
+    feeds the matching decoder block's concat coming back up. `taps["conv1"
+    .."conv6"]` below are therefore all the raw tensor -- this is a general
+    rule across every encoder layer, verified against the literal source
+    above, not an assumption or a conv6-only special case.
+
+    The conv6 bottleneck applies the same rule one step further, plus an
+    extra wrinkle: upstream computes
         conv6 = Conv2D(...)(rel5)
         batch6 = BatchNormalization(...)(conv6)
         _ = conv_activation_layer(batch6)          # <- discarded
         up1 = Conv2DTranspose(...)((conv6))         # <- fed from conv6, RAW
     batch6 and the LeakyReLU that would follow it are computed (so the
     checkpoint carries trained gamma/beta/moving_mean/moving_variance for
-    it) but their output is never used -- up1 is wired to the raw conv6
-    tensor, not to batch6 or its activation. This was verified against
-    the literal upstream source, not assumed; getting it backwards would
-    make every downstream decoder fixture wrong. `taps["conv6"]` below is
-    therefore the raw pre-BN, pre-activation tensor: that is the value a
-    correct implementation must produce at that name to feed up1 correctly,
-    which is the only thing this reference is for.
+    it) but their output is never used anywhere -- not as a skip source
+    like conv1..conv5's raw tensors, not as anything. `taps["conv6"]` is
+    the same raw tensor as conv1..conv5's taps; it just also happens to be
+    conv6's *only* consumer, since there is no `rel6` feeding a seventh
+    encoder stage. Getting either the general rule or this extra wrinkle
+    backwards would make the corresponding downstream fixture(s) wrong.
 
     Returns (masked_output, taps) where taps maps the 13 layer ids this
     task must capture ("conv1".."conv6", "up1".."up6", "out") to tensors.
@@ -149,7 +188,13 @@ def load_weights(reader, mapping, model):
 def dump_layer(raw_dir, layer_id, act_tfc):
     """act_tfc: (T, F, C) numpy array (Keras' native axis order for one
     segment). Writes the raw fixture as ggml's [C][T][F] byte order (F
-    fastest) and returns the fixtures.json entry for this layer."""
+    fastest) and returns the fixtures.json entry for this layer.
+
+    Sample positions are drawn from a *fresh* `default_rng(SEED)` here,
+    once per layer, rather than one continuing stream shared across all
+    26 layers. That makes each layer's 64 positions depend only on that
+    layer's own shape, not on the order layers happen to be processed in
+    -- reproducible layer-by-layer in isolation, not only as a full run."""
     t, f, c = act_tfc.shape
     act_ctf = np.ascontiguousarray(np.transpose(act_tfc, (2, 0, 1)))  # (C, T, F)
     act_ctf.tofile(os.path.join(raw_dir, f"{layer_id}.f32"))
