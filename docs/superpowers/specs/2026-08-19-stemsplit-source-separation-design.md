@@ -94,7 +94,8 @@ implementation must match them exactly.
 ### 4.3 Network architecture (per instrument)
 
 Encoder — six blocks, each `Conv2D 5x5 stride 2 SAME` then `BatchNorm` then
-`LeakyReLU(0.2)`:
+`LeakyReLU(0.2)`. **Each block has two distinct outputs — see section 4.3.1,
+which corrects this table.**
 
 | Layer | Out channels | Out shape (T x F) |
 |---|---|---|
@@ -123,6 +124,58 @@ by the network input.
 
 Approximately **9.82 M parameters per instrument**, about 20 MB at fp16. The
 `2stems` configuration is two such networks, about **39 MB**.
+
+### 4.3.1 Corrections to 4.3, from reading the real graph (2026-08-19)
+
+The tables above describe the architecture as it is usually summarised. Reading
+`spleeter/model/functions/unet.py` directly, during Task 3, turned up three
+places where the real graph differs. The released weights were trained with the
+real graph, so **these are not defects to fix — they are behaviour to reproduce.**
+All three were verified against upstream source, quoted below.
+
+**(a) Every skip connection uses the RAW convolution output, not the activated one.**
+
+```python
+merge1 = Concatenate(axis=-1)([conv5, drop1])
+merge2 = Concatenate(axis=-1)([conv4, drop2])
+merge3 = Concatenate(axis=-1)([conv3, drop3])
+merge4 = Concatenate(axis=-1)([conv2, batch10])
+merge5 = Concatenate(axis=-1)([conv1, batch11])
+```
+
+The decoder concatenates `conv1..conv5` — the pre-BatchNorm, pre-activation
+tensors — never `rel1..rel5`. So each encoder block produces **two** outputs
+that both matter:
+
+| Output | Definition | Consumed by |
+|---|---|---|
+| raw `conv_n` | `Conv2D(...)` result plus bias | the skip concatenation into `up_{6-n}` |
+| `rel_n` | `LeakyReLU(0.2)(BatchNorm(conv_n))` | the next encoder block |
+
+An implementation whose encoder block returns only the activated tensor cannot
+wire the skips correctly. This is a correctness bug in separation quality, not
+merely a failing test.
+
+**(b) The sixth encoder block's BatchNorm and activation are dead code.**
+
+```python
+conv6  = conv2d_factory(conv_n_filters[5], (5, 5))(rel5)
+batch6 = BatchNormalization(axis=-1)(conv6)
+_      = conv_activation_layer(batch6)          # result discarded
+up1    = conv2d_transpose_factory(conv_n_filters[4], (5, 5))((conv6))
+```
+
+`up1` consumes raw `conv6`. `batch6` and its activation are computed and thrown
+away. The `conv6` BatchNorm parameters still exist in the checkpoint and are
+still exported to the GGUF — keeping them preserves the 100-tensor count and the
+uniform tensor naming — but the runtime must **never apply them**.
+
+**(c) Dropout is applied to only three of the six decoder blocks.**
+
+`merge1..merge3` concatenate `drop1..drop3`, while `merge4` and `merge5`
+concatenate `batch10` and `batch11` directly, with no Dropout layer between.
+This has no effect on inference, where Dropout is identity in every case, and is
+recorded only so the next reader of this document does not "fix" the asymmetry.
 
 **Note on activation ordering.** The encoder is `conv -> BN -> activation`, so its
 BatchNorm folds backward into the convolution. The **decoder is
