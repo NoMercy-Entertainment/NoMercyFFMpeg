@@ -283,11 +283,20 @@ stopping before FFmpeg's own build so the configured source tree survives).
     (`scripts/48-whisper.sh:158-186`) — without it, FFmpeg's whisper
     pkg-config link-test fails the same way and configure misreports
     "whisper >= 1.7.5 not found".
-- **`HAS_CONV2D_DIRECT` = yes.** `ggml_conv_2d_direct(ctx, a, b, s0, s1, p0,
-  p1, d0, d1)` is declared in `ggml.h` and links cleanly with F32 kernels
-  (kernel `a` is `[KW, KH, IC, OC]`, input `b` is `[W, H, C, N]`). Per section
-  6.3, Unit 3 uses it instead of `ggml_conv_2d`'s im2col path, so weights do
-  not need to be forced to F16 for the `Conv2D` layers.
+- **`HAS_CONV2D_DIRECT` = yes, but unused.** `ggml_conv_2d_direct(ctx, a, b,
+  s0, s1, p0, p1, d0, d1)` is declared in `ggml.h` and links cleanly with F32
+  kernels (kernel `a` is `[KW, KH, IC, OC]`, input `b` is `[W, H, C, N]`).
+  F16 + `ggml_conv_2d` remains the plan of record: all conv kernels are
+  stored F16 (tensor-layout constraint, section 6.1), the released artifact
+  is `spleeter-2stems-f16.gguf` at ~39 MB (sections 1 and 6.1 — F32 kernels
+  would double that), and `ggml_conv_transpose_2d_p0`, which the six decoder
+  layers need, still takes F16 kernels regardless — going F32 for the
+  encoder only would leave the model half-F32/half-F16 for no stated
+  benefit. `ggml_conv_2d_direct` is recorded here as available and is the
+  sanctioned escape hatch if, and only if, Task 7 or Task 8 parity fails at
+  rtol 1e-3 *because of* F16 precision loss. If that happens, the artifact
+  name, size and tolerance get revisited then, deliberately, rather than
+  drifting now.
 - **`ggml_pad_ext` (Ruling 5 probe) = exists.** Signature:
   `ggml_pad_ext(ctx, a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3)` — zero-pads
   each of the 4 dimensions independently on the left and right. This is a
@@ -439,8 +448,8 @@ does with `cb_log`.
 | Risk | Severity | Mitigation |
 |---|---|---|
 | Asymmetric SAME padding implemented wrong | **high** — output sounds plausible but is incorrect | per-layer parity tests (9.2) gate all other work |
-| `gguf.h` not installed by whisper.cpp | medium — blocks model loading | decided in step 1; fallback is a flat container |
-| `ggml_conv_2d` F16 kernel constraint | low | weights are fp16 by design |
+| `gguf.h` not installed by whisper.cpp | ~~medium~~ **resolved** — `HAS_GGUF_H = yes`, probed 2026-08-19 (6.3.1) | n/a — real GGUF confirmed available, flat-container fallback not needed |
+| `ggml_conv_2d` F16 kernel constraint | ~~low~~ **resolved** — `HAS_CONV2D_DIRECT = yes`, probed 2026-08-19 (6.3.1) | F16 + `ggml_conv_2d` stays the plan of record; `ggml_conv_2d_direct` is the sanctioned escape hatch only if Task 7/8 parity fails at rtol 1e-3 because of F16 precision loss (see 6.3.1) |
 | 11.9 s latency surprises a caller | low | documented as offline-only |
 | Quality below expectations for some material | medium | Spleeter's known ceiling; `highband=passthrough` recovers part of it; model is swappable |
 | freebsd / windows-aarch64 lack BLAS | low | ggml's own kernels are used, as they already are for whisper on those targets |
