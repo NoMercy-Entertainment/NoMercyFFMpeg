@@ -75,6 +75,14 @@ implementation must match them exactly.
    `[T=512, F=1024, C=2]`, raw magnitude with no normalisation.
 4. Run one U-Net **per instrument**. Each emits a sigmoid mask which is multiplied
    by the network input to yield that instrument's estimated magnitude `S_i`.
+
+   **Two distinct tensors, easily conflated.** The network's final layer — the one
+   named `out`, dumped for parity and recorded in `fixtures.json` — is the
+   **sigmoid mask itself**, before the multiply. Its values lie in [0, 1]. The
+   **estimated magnitude** `S_i = out * input` is a separate quantity, and it is
+   `S_i` that feeds the ratio-mask formula in step 5. Both are correct and both
+   exist in the implementation; only the shared name invites confusion. This is
+   also why the layer count is 13 per network rather than 14.
 5. Build ratio masks across instruments:
 
    ```
@@ -188,10 +196,28 @@ of conversion bugs. Dropout is identity at inference and is dropped entirely.
 ### 4.4 Compute and memory budget
 
 About 6.1 GMAC per 11.9 s segment per instrument, roughly **1 GFLOP per second of
-audio per stem**. With a BLAS-backed gemm this is roughly **5–20x realtime per
-core** — less work than whisper-base, which this repo already ships. Peak resident
-memory is estimated below 200 MB: about 40 MB weights, 60 MB activations, 30 MB
-im2col scratch.
+audio per stem**.
+
+**Measured, superseding this document's original estimate.** A full forward pass
+costs about **3.3 s per instrument per 11.888 s segment** on 16 threads of an
+i7-10700K, so the `2stems` pair runs at roughly **1.8x realtime wall-clock** —
+about **0.11x realtime per core**.
+
+The original text here claimed 5-20x realtime per core, derived from the MAC count
+on the assumption of a BLAS-backed gemm running near peak. That assumption does
+not hold: the graph uses `ggml_conv_2d_direct` (see 6.3.1 and Ruling 16), which is
+not gemm-optimised, and the F16 im2col path it replaced was not faster — it was
+11% slower and used 5 MiB more. The estimate was wrong by roughly two orders of
+magnitude per core and is corrected here rather than left to mislead.
+
+This remains acceptable for the stated use case and does not change the design:
+section 3 scopes this filter to offline processing, and a four-minute track
+separates in a little over two minutes on a 16-thread machine — fine for a media
+server pre-generating karaoke tracks on library scan, and unsuitable for
+real-time playback, exactly as already documented.
+
+Peak resident memory is **141 MiB measured**, against an estimated budget of
+200 MB.
 
 ---
 
