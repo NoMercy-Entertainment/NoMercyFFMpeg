@@ -312,6 +312,7 @@ ffmpeg -i song.flac -filter_complex \
 | `highband` | enum | `passthrough` | `passthrough`, `zeros`, or `average` |
 | `overlap` | duration | `0` | crossfade between segments |
 | `threads` | int | `0` | ggml CPU threads; 0 means the filter default |
+| `dump` | string | `""` | **internal.** Directory to write per-layer tensors to, for the parity tests of section 9.2. Not documented in the README. |
 
 `stem=all` uses `AVFILTER_FLAG_DYNAMIC_OUTPUTS`, appending output pads in `init()`
 via `ff_append_outpad` — the `af_channelsplit` pattern. `stem=<name>` produces a
