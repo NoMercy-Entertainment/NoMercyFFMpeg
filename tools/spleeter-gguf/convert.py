@@ -55,6 +55,26 @@ def verify(tensors):
     print(f"verify OK: {len(EXPECTED)} tensors")
 
 
+def verify_dtypes(tensors):
+    """Enforce Ruling 7 (weights are F16; bias/BatchNorm/metadata stay F32).
+
+    verify() above checks shape only -- it would pass even if conv_weight()
+    stopped casting to float16, silently doubling the artifact's size and
+    violating the released model's identity (spleeter-2stems-f16.gguf).
+    This closes that gap: every `.weight` tensor must be float16, every
+    other tensor (`.bias`, `.bn_a`, `.bn_b`) must be float32. Called
+    unconditionally from main() so a future regenerator gets this for free,
+    without needing to know to ask for it.
+    """
+    bad = []
+    for name, arr in tensors.items():
+        want = np.float16 if name.endswith(".weight") else np.float32
+        if arr.dtype != want:
+            bad.append(f"{name}: expected dtype {np.dtype(want).name}, got {arr.dtype}")
+    assert not bad, "dtype mismatch:\n  " + "\n  ".join(bad)
+    print(f"verify_dtypes OK: {len(tensors)} tensors")
+
+
 # ---------------------------------------------------------------------------
 # Step 4: the implementation.
 # ---------------------------------------------------------------------------
@@ -226,6 +246,7 @@ def main():
     tensors = gather_tensors(reader)
 
     verify(tensors)
+    verify_dtypes(tensors)
 
     write_gguf(tensors, args.output)
     print(f"wrote {args.output}")

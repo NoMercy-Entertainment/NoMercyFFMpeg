@@ -94,8 +94,10 @@ rewrites the leading `/work/...` and `/out/...` paths into Windows paths
 before they reach the container.)
 
 This prints the resolved instrument-to-checkpoint-variable mapping, runs the
-three shape checks, calls `verify()`, and — only if that passes — writes the
-GGUF file. Expected: `verify OK: 100 tensors`, then
+three shape checks, calls `verify()` (tensor names and shapes) and then
+`verify_dtypes()` (every `.weight` is float16, everything else is float32),
+and — only if both pass — writes the GGUF file. Expected: `verify OK: 100
+tensors`, then `verify_dtypes OK: 100 tensors`, then
 `wrote /out/spleeter-2stems-f16.gguf`, roughly 39 MB.
 
 Do not commit the output file (`out/` or wherever you point `--output`) —
@@ -128,7 +130,19 @@ they feed it.
 
 If this file needs to be regenerated (e.g. a future Spleeter release, or a
 change to the tensor layout the filter expects): re-run the build and
-convert commands above. `convert.py`'s `EXPECTED` table and `build_mapping()`
-shape checks will fail loudly if the checkpoint's variable names, shapes, or
-instrument-split point ever change — treat any such failure as a real
-architecture change to investigate, not something to route around.
+convert commands above. `convert.py` runs two checks unconditionally on the
+regen path, and either one failing means stop and investigate — not
+something to route around:
+
+- `verify()` and `build_mapping()`'s three shape checks fail loudly if the
+  checkpoint's variable names, shapes, or instrument-split point ever
+  change.
+- `verify_dtypes()` fails loudly if any `.weight` tensor is not float16, or
+  any `.bias`/`.bn_a`/`.bn_b` tensor is not float32 — e.g. if a future edit
+  to `conv_weight()` drops the cast to F16, which `verify()` alone would
+  not catch since it only checks shape.
+
+Neither check inspects tensor *values* — only names, shapes, and dtypes.
+Numerical correctness (that the BatchNorm reduction and axis swap actually
+produce the right numbers) is Task 3's job (`dump_reference.py` /
+`compare.py`), not this converter's.
