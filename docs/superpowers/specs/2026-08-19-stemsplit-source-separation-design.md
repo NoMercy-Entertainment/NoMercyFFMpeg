@@ -259,6 +259,45 @@ Two ggml details to confirm during implementation, each with a stated fallback:
   version, tensor table — as `demucs.cpp` does. This decision is made in the first
   implementation step, before any other work depends on it.
 
+#### 6.3.1 ggml capability probe results (probed 2026-08-19)
+
+Both unknowns were settled against the pinned whisper.cpp 1.9.1 ggml, using a
+throwaway Docker harness (`ffstem-vol:latest`, built from a scratchpad
+Dockerfile that runs only `scripts/03-zlib.sh`, `scripts/04-fftw3.sh` and
+`scripts/48-whisper.sh` against `nomercyentertainment/ffmpeg-base:latest`,
+stopping before FFmpeg's own build so the configured source tree survives).
+
+- **`HAS_GGUF_H` = yes.** `${PREFIX}/include/gguf.h` is installed by whisper's
+  cmake install step, and `gguf_init_from_file()` compiles, links and runs
+  (verified against a nonexistent path, which correctly returns an error
+  rather than crashing). The GGUF reader is available — the plan proceeds
+  with real GGUF, not the flat-container fallback.
+  - Note for implementers: linking any translation unit that calls into
+    `gguf_init_from_file` pulls in `ggml-quants.c`'s OpenMP-parallelized
+    quantization initializers (`iq2xs_init_impl`, `iq3xs_init_impl`), which
+    need `-fopenmp` (glibc: `-lgomp`) on the link line or you get spurious
+    `undefined reference to GOMP_*` errors that look like "gguf.h is
+    unusable" but are not. This is the same root cause as FFmpeg's own
+    `./configure` needing `--pkg-config-flags=--static` to pick up
+    `whisper.pc`'s `Libs.private: -lstdc++ -lm -fopenmp`
+    (`scripts/48-whisper.sh:158-186`) — without it, FFmpeg's whisper
+    pkg-config link-test fails the same way and configure misreports
+    "whisper >= 1.7.5 not found".
+- **`HAS_CONV2D_DIRECT` = yes.** `ggml_conv_2d_direct(ctx, a, b, s0, s1, p0,
+  p1, d0, d1)` is declared in `ggml.h` and links cleanly with F32 kernels
+  (kernel `a` is `[KW, KH, IC, OC]`, input `b` is `[W, H, C, N]`). Per section
+  6.3, Unit 3 uses it instead of `ggml_conv_2d`'s im2col path, so weights do
+  not need to be forced to F16 for the `Conv2D` layers.
+- **`ggml_pad_ext` (Ruling 5 probe) = exists.** Signature:
+  `ggml_pad_ext(ctx, a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3)` — zero-pads
+  each of the 4 dimensions independently on the left and right. This is a
+  native per-side padding op, unlike `ggml_pad`/`ggml_pad_circular`
+  (symmetric-only, `p0..p3`). It directly expresses the asymmetric
+  TensorFlow `SAME` padding (1 before, 2 after) that section 6.3's `Conv2D
+  5x5 s2 SAME` row currently emulates by hand via a zeroed intermediate
+  tensor — a later task may use it to simplify that emulation, but this task
+  makes no implementation change; it only confirms the op is available.
+
 ### 6.4 Unit 4 — build integration (`scripts/60-stemsplit.sh`)
 
 Follows `scripts/57-keydetect.sh` verbatim in structure:
