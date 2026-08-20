@@ -283,6 +283,9 @@ run_test "libxml2" "-hide_banner -version | grep xml" "xml"
 run_test "libdav1d" "-hide_banner -decoders" "dav1d"
 run_test "librav1e" "-hide_banner -encoders" "rav1e"
 
+# Stemsplit filter
+run_test "stemsplit" "-hide_banner -filters | grep stemsplit" "stemsplit"
+
 # OCR subtitle encoder
 run_test "ocr_subtitle" "-hide_banner -encoders" "ocr_subtitle"
 
