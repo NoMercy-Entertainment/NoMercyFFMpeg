@@ -178,6 +178,7 @@ Our custom FFmpeg builds include several features **NOT** available in official 
 |-----------|------|--------------|
 | **`keydetect`** | Audio filter | Musical key and chord detection |
 | **`beatdetect`** | Audio filter | Beat detection via spectral flux analysis |
+| **`stemsplit`** | Audio filter | Music source separation into vocal and accompaniment stems (Spleeter 2stems on ggml) |
 | **OCR subtitle encoder** | Codec | Converts bitmap subtitles (DVD/Blu-ray) to WebVTT text using Tesseract OCR |
 | **Sprite-sheet muxer** | Muxer | Generates thumbnail sprite sheets with a WebVTT timeline for player scrubbing |
 | **Chapter VTT muxer** | Muxer | Exports chapter metadata as WebVTT |
@@ -188,6 +189,81 @@ Our custom FFmpeg builds include several features **NOT** available in official 
 | **HEVC alpha layer** | Decoder patch | Decodes the alpha channel of HEVC-with-alpha video from Apple VideoToolbox (single `hvc1` track, two-layer bitstream) instead of silently dropping it. Backports upstream `eedf8f0165fe` + `3befae81f1dc`, neither of which reached 8.1.x, plus a NoMercy change so `ffprobe` reports `yuva420p` at stream level and not just per frame ([ticket #7965](https://trac.ffmpeg.org/ticket/7965)) |
 | **`whisper` language detection** | Filter patch | The `whisper` filter exposes the auto-detected spoken language (`lavfi.whisper.language` + `lavfi.whisper.language_confidence` frame metadata, `detected_language` object in JSON output) |
 | **AACS/BD+ static keydb** | Patch | libaacs/libbluray patched for built-in Blu-ray decryption support |
+
+#### 🎤 **`stemsplit` — Music Source Separation**
+
+Separates a music track into `vocals` and `accompaniment` stems using the
+Deezer Spleeter `2stems` U-Net, run on **ggml** — the same runtime already
+statically linked into every platform binary for the `whisper` filter, so
+`stemsplit` adds no new dependency and no growth of the shipped tarball.
+
+```bash
+# Karaoke: instrumental only, plain -af
+ffmpeg -i song.flac -af "stemsplit=model=2stems.gguf:stem=accompaniment,asetnsamples=n=4096" karaoke.flac
+
+# Both stems, one filtergraph with two outputs
+ffmpeg -i song.flac -filter_complex \
+  "[0:a]stemsplit=model=2stems.gguf:stem=all[v][a];[v]asetnsamples=n=4096[vo];[a]asetnsamples=n=4096[ao]" \
+  -map "[vo]" vocals.flac -map "[ao]" music.flac
+```
+
+`stemsplit` emits one large frame per ~11.9 s segment (524,288 samples, or
+520,192 on the first segment after the lead-in crop) rather than a stream of
+small frames — most encoders don't mind, but FLAC's block size is capped at
+65,535 samples and rejects it outright (`invalid block size`). The
+`asetnsamples=n=4096` above rechunks the output before the FLAC encoder sees
+it; drop it if you're encoding to a format without a block-size ceiling
+(e.g. WAV/PCM).
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `model` | string | *required* | Path to the `.gguf` model file |
+| `stem` | enum | `all` | `vocals`, `accompaniment`, or `all` (one output pad per stem) |
+| `highband` | enum | `passthrough` | `passthrough` routes the mixture's untouched high band (>11 025 Hz) into the last stem instead of silencing it, an improvement over stock Spleeter's muffled output; `zeros` reproduces upstream Spleeter bit-for-bit; `average` tiles each frame's mean mask across the high band |
+| `overlap` | duration | `0` | Crossfade between segments (e.g. `5`, `1.5`, `00:00:05.000`); `0` matches reference Spleeter's un-overlapped chunking |
+| `threads` | int | `0` | ggml CPU threads; `0` uses the filter's default |
+
+**Model:** `spleeter-2stems-f16.gguf` (39,319,552 bytes) is published as a
+GitHub release asset on this repository, downloaded the same way whisper's
+ggml models are — not bundled in the platform tarballs. *At the time of
+writing this asset has not yet been attached to a release; the download
+link will resolve once it is published.*
+
+**This is an offline filter, by design.** The network needs a full ~512-frame
+(~11.9 s) segment before it can emit anything, so `stemsplit` is unsuitable
+for live playback — that lookahead is what the architecture requires, not an
+oversight. Throughput on 16 threads of a modern desktop CPU is roughly
+**1.8x realtime** for the `2stems` pair (about 0.11x realtime per core,
+since ggml's own kernels — not a BLAS gemm — drive the convolutions here):
+a four-minute track takes a little over two minutes to separate on such a
+machine. Peak resident memory is about **194 MiB**, rising to about
+**211 MiB** with `overlap` set non-zero. This makes it a good fit for a
+media server pre-generating karaoke tracks on library scan, not for
+real-time use.
+
+**What's verified and what isn't.** The network's output is checked
+layer-by-layer against a Python reference (26 of 26 layers across both
+instrument networks, `rtol=1e-3`) — that is what establishes the ggml graph
+faithfully reproduces Spleeter's published weights. Separately, summing the
+two output stems reconstructs the original mixture to about -138 dB, but
+that figure validates only the STFT/overlap-add signal path: the ratio masks
+sum to 1 by construction, so the same result holds even if the network's
+output were garbage — a deliberate mask-swap mutation still measured
+-138.2 dB. **No human has listened to the separated output yet**; treat
+separation quality as unverified until that listening pass happens.
+
+**Licensing.** Spleeter's code and released model checkpoints are
+MIT-licensed. If you use this filter or its model in published work, please
+cite:
+
+> Hennequin, Khlif, Voituret, Moussallam (2020). Spleeter: a fast and
+> efficient music source separation tool with pre-trained models. *Journal
+> of Open Source Software*, 5(50), 2154,
+> [doi:10.21105/joss.02154](https://doi.org/10.21105/joss.02154).
+
+As with any source-separation tool, **you must hold the rights to any
+copyrighted material you process** — this carries forward Spleeter's own
+upstream advisory.
 
 #### 🤖 **AI & Analysis**
 - **OpenAI Whisper Integration**: Built-in speech-to-text via whisper.cpp (`--enable-whisper`)
