@@ -110,9 +110,9 @@ static inline size_t ss_nidx(int c, int t, int f)
  * tools/spleeter-gguf/convert.py's EXPECTED table exactly -- that table is
  * the authoritative tensor contract, not this comment.
  *
- * Ruling 9: every conv[].bn_a/bn_b and up[].bn_a/bn_b is loaded and shape
- * validated here, including vocals/accompaniment.conv6's, even though the
- * real Spleeter graph never applies conv6's BatchNorm (up1 consumes raw
+ * Every conv[].bn_a/bn_b and up[].bn_a/bn_b is loaded and shape validated
+ * here, including vocals/accompaniment.conv6's, even though the real
+ * Spleeter graph never applies conv6's BatchNorm (up1 consumes raw
  * conv6 -- design section 4.3.1(b)). That is a Task 7 compute-graph
  * decision, not a loading-time one: dropping the tensor here would change
  * the file's tensor count and break the converter's verify() contract.
@@ -873,8 +873,8 @@ static struct ggml_tensor *ss_bn(struct ggml_context *g,
  * Conv2D(..., padding="same") output: Keras folds the bias into the layer's
  * result, so everything Spleeter calls "conv_n" includes it.
  *
- * Ruling 16: this uses ggml_conv_2d_direct with the kernel cast to F32, not
- * ggml_conv_2d. ggml_conv_2d lowers to im2col with dst_type = GGML_TYPE_F16,
+ * This uses ggml_conv_2d_direct with the kernel cast to F32, not ggml_conv_2d.
+ * ggml_conv_2d lowers to im2col with dst_type = GGML_TYPE_F16,
  * so it rounds the *activations* to half precision as well as using the
  * model's F16 weights. That second rounding is a property of the op, not of
  * the artifact, and it is what stopped per-layer parity: measured against the
@@ -1045,15 +1045,16 @@ static struct ggml_tensor *ss_crop2d(struct ggml_context *g,
  * silently permute the next convolution's input channels: no shape changes,
  * no error is raised, and the output is wrong everywhere.
  *
- * Ruling 16's F32 kernel cast applies here too, and it matters more than it
- * did in the encoder. Handed an F16 kernel, ggml_conv_transpose_2d_p0 rounds
- * the input activations to F16 as well and lands about 2e-4 relative away
- * from a double-precision reference; handed an F32 kernel it computes in F32
- * throughout and lands at 6.5e-8. Both figures were measured against the
- * pinned ggml before this code was written, along with a check that its
- * work-buffer sizing is type-aware (4245760 bytes for an F32 kernel where an
- * F16 one gets 2123008), so the F32 path is a real path and not an overflow
- * waiting to happen. Six of these layers compound, so do not revert the cast.
+ * The F32 kernel cast that ss_conv_bias explains applies here too, and it
+ * matters more here than it did there. Handed an F16 kernel,
+ * ggml_conv_transpose_2d_p0 rounds the input activations to F16 as well and
+ * lands about 2e-4 relative away from a double-precision reference; handed an
+ * F32 kernel it computes in F32 throughout and lands at 6.5e-8. Both figures
+ * were measured against the pinned ggml before this code was written, along
+ * with a check that its work-buffer sizing is type-aware (4245760 bytes for an
+ * F32 kernel where an F16 one gets 2123008), so the F32 path is a real path
+ * and not an overflow waiting to happen. Six of these layers compound, so do
+ * not revert the cast.
  */
 static struct ggml_tensor *ss_decoder_block(struct ggml_context *g,
                                             struct ggml_tensor *x,
@@ -1378,8 +1379,8 @@ static int ss_dump_taps(AVFilterContext *ctx)
  *
  * `mag` is [C=2][T=512][F=1024] float32, frequency contiguous -- byte for byte
  * ggml's ne = [F, T, C, 1]. out[i], when non-NULL, receives instrument i's
- * ESTIMATED MAGNITUDE S_i = sigmoid_mask * mag in the same layout (Ruling 17),
- * not the bare sigmoid. The caller owns both buffers.
+ * ESTIMATED MAGNITUDE S_i = sigmoid_mask * mag in the same layout (design 4.2
+ * step 4), not the bare sigmoid. The caller owns both buffers.
  */
 static int ss_infer(AVFilterContext *ctx, const float *mag,
                     float *out[SS_NB_INSTRUMENTS])
@@ -2000,10 +2001,10 @@ static int ss_driver_init(AVFilterContext *ctx)
     const size_t mask_floats = (size_t) SS_CHANNELS * SS_T * SS_BINS;
     int c, i, j;
 
-    /* Ruling 11: `overlap` is a duration, because a user should not have to
-     * know that a segment is 512 STFT frames of 1024 samples to ask for a
-     * second and a half of crossfade. The conversion lives here, where the
-     * arithmetic is. */
+    /* `overlap` is a duration, because a user should not have to know that a
+     * segment is 512 STFT frames of 1024 samples to ask for a second and a
+     * half of crossfade. The conversion lives here, where the arithmetic
+     * is. */
     const int64_t want_frames = av_rescale(s->overlap, SS_SAMPLE_RATE,
                                            AV_TIME_BASE) / SS_FRAME_STEP;
 
@@ -2090,8 +2091,8 @@ static int ss_driver_init(AVFilterContext *ctx)
 
     s->crop_remaining = SS_FRAME_LENGTH;
 
-    /* The clamp is [0, SS_T-1] per Ruling 11, so a user can ask for an overlap
-     * of nearly a whole segment -- and pay for it, because the cost is exactly
+    /* The clamp is [0, SS_T-1], so a user can ask for an overlap of nearly a
+     * whole segment -- and pay for it, because the cost is exactly
      * SS_T / hop_frames forward passes per segment of audio. Say so rather
      * than let it look like a hang. */
     if (s->hop_frames * 4 < SS_T)

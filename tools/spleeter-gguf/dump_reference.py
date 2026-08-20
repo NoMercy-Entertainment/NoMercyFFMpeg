@@ -37,7 +37,7 @@ code, computed but never consumed anywhere).
 Precision: conv kernels are loaded F16-rounded (`load_weights()` does
 `kernel.astype(np.float16).astype(np.float32)` before handing them to
 Keras). This is deliberate, not a bug -- convert.py ships `.weight`
-tensors as F16 (Ruling 7; `conv_weight()`, `verify_dtypes()`), so the
+tensors as F16 (`conv_weight()`, `verify_dtypes()`), so the
 runtime never sees full-precision kernels. A fixture computed from
 unrounded F32 kernels describes a different, more precise network than
 the one that actually ships, and F16's ~1e-3 rounding error alone can
@@ -180,11 +180,11 @@ def load_weights(reader, mapping, model):
     Keras (still stored and computed as F32 -- only the *values* are
     rounded to what F16 can represent). This mirrors convert.py's
     conv_weight(), which casts every `.weight` tensor to F16 for the
-    shipped GGUF (Ruling 7: weights are F16, everything else stays F32).
-    Ruling 14: the reference must be generated from the same rounded
-    values the runtime actually loads, or the comparison is between two
-    different networks -- a full-precision one here and a half-precision
-    one at runtime -- and F16's ~1e-3 rounding error alone can exceed
+    shipped GGUF (weights are F16, everything else stays F32). The
+    reference must be generated from the same rounded values the runtime
+    actually loads, or the comparison is between two different networks
+    -- a full-precision one here and a half-precision one at runtime --
+    and F16's ~1e-3 rounding error alone can exceed
     compare.py's rtol, failing a bit-correct ggml implementation. Biases
     and BatchNorm's affine terms are F32 in the shipped artifact (see
     convert.py's EXPECTED / verify_dtypes()) and are therefore loaded

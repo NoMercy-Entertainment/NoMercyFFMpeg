@@ -104,6 +104,99 @@ Do not commit the output file (`out/` or wherever you point `--output`) —
 copy it to wherever this repository's release pipeline picks up model
 assets instead.
 
+## Verify the shipped filter against the fixtures
+
+`fixtures.json` (committed, ~55 KB) is the per-layer reference the `stemsplit`
+filter is checked against: 26 entries, one per layer per instrument, each with
+a shape, four summary statistics and 64 fixed sample points. It only guards
+anything if somebody runs it, so here is the whole procedure against a built
+`ffmpeg` binary. Any change to `af_stemsplit.c`'s numerics should be followed
+by this, and a result other than `26/26 layers match` is a regression in that
+change rather than a tolerance to loosen.
+
+Five comments in `af_stemsplit.c` name this test as the thing that catches a
+specific mistake: symmetric instead of asymmetric TensorFlow `SAME` padding,
+symmetric instead of front-biased transpose cropping, `ggml_conv_2d` instead of
+`ggml_conv_2d_direct`, and the two F32 kernel casts. Every one of those
+produces correctly *shaped*, plausible-sounding output and raises no error.
+
+Run all three steps from `tools/spleeter-gguf/`.
+
+### 1. Regenerate `fixtures_input.f32`
+
+`fixtures.json` on its own is not enough: the filter has to be fed the exact
+input spectrogram the fixtures were computed from. That is `fixtures_input.f32`
+— `[C=2][T=512][F=1024]` float32, F fastest, 4,194,304 bytes — which
+`dump_reference.py` writes into the **parent** directory of `--raw-dir`. It is
+a generated artifact and deliberately not committed (4 MB, over this repo's
+1 MB file-size limit), so regenerate it before verifying:
+
+```bash
+mkdir -p out
+docker run --rm -v "$PWD/out:/out" spleeter-gguf dump_reference.py \
+    --checkpoint /work/2stems --fixtures /out/fixtures.json --raw-dir /out/ref
+```
+
+That writes `out/fixtures_input.f32`, the full reference activations in
+`out/ref/<inst>.<layer>.f32` (also not committed) and `out/fixtures.json`. The
+last of those should be identical to the committed `fixtures.json`; if it is
+not, the fixtures and the checkpoint have drifted apart, and that is what to
+investigate before anything else.
+
+**`fixtures_input.f32` and `fixtures.json` are one unit.** The same run
+produces both, describing the same forward pass. Regenerating the fixtures
+without regenerating the input — or the reverse — makes the comparison
+meaningless, because the filter would then be measured on a different
+spectrogram than the reference statistics came from. Any change to the fixtures
+must regenerate both.
+
+### 2. Run the filter's parity path
+
+`debug_input=` injects that spectrogram straight into the networks, bypassing
+the STFT and the segment driver entirely, and `dump=` writes every layer tap to
+disk. The audio input is irrelevant — the hook runs at filter init — but
+`ffmpeg` still needs one, hence `anullsrc`. Use `stem=vocals` (or any single
+stem): the default `stem=all` exposes two output pads and `-af` accepts only
+one. The `dump` directory must already exist.
+
+```bash
+mkdir -p dump
+M=spleeter-2stems-f16.gguf   # wherever you put the converted model
+ffmpeg -hide_banner -y \
+    -f lavfi -i "anullsrc=sample_rate=44100:channel_layout=stereo:d=0.1" \
+    -af "stemsplit=model=$M:stem=vocals:debug_input=out/fixtures_input.f32:dump=dump" \
+    -f null -
+```
+
+Both instruments' networks are dumped whatever `stem` says, because they share
+one compute graph. Expect 30 files in `dump/`: the 26 fixture taps
+(`<inst>.{conv1..conv6,up1..up6,out}.f32`) plus `<inst>.input.f32` and
+`<inst>.est.f32`, two diagnostics `compare.py` ignores.
+
+### 3. Compare
+
+```bash
+docker run --rm -v "$PWD:/w" spleeter-gguf compare.py \
+    --fixtures /w/fixtures.json --dump /w/dump
+```
+
+Expected, and the only acceptable result:
+
+```
+26/26 layers match
+```
+
+Exit code 0. On failure `compare.py` exits 1 and prints one line per failing
+layer, naming the statistic or sample point that disagreed — which localises a
+regression to a layer. `--rtol` defaults to 1e-3 and `--layers <substring>`
+narrows a run to, say, `conv` or `vocals` while bisecting; neither is a knob to
+turn to make a failure go away. The tolerance is 1e-3 because the shipped
+weights are F16 and F16 rounding alone reaches roughly that magnitude, so it is
+already sized to the artifact rather than padded for comfort.
+
+(On Windows Git Bash, prefix every `docker` command above with
+`MSYS_NO_PATHCONV=1`, as with the convert step.)
+
 ## Licensing and attribution
 
 The Spleeter source code and the `2stems` pretrained checkpoint are

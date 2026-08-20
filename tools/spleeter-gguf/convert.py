@@ -56,7 +56,8 @@ def verify(tensors):
 
 
 def verify_dtypes(tensors):
-    """Enforce Ruling 7 (weights are F16; bias/BatchNorm/metadata stay F32).
+    """Enforce the artifact's dtype contract: weights are F16, while
+    bias/BatchNorm/metadata stay F32.
 
     verify() above checks shape only -- it would pass even if conv_weight()
     stopped casting to float16, silently doubling the artifact's size and

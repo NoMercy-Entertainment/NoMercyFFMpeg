@@ -205,7 +205,7 @@ about **0.11x realtime per core**.
 
 The original text here claimed 5-20x realtime per core, derived from the MAC count
 on the assumption of a BLAS-backed gemm running near peak. That assumption does
-not hold: the graph uses `ggml_conv_2d_direct` (see 6.3.1 and Ruling 16), which is
+not hold: the graph uses `ggml_conv_2d_direct` (see 6.3.1), which is
 not gemm-optimised, and the F16 im2col path it replaced was not faster — it was
 11% slower and used 5 MiB more. The estimate was wrong by roughly two orders of
 magnitude per core and is corrected here rather than left to mislead.
@@ -400,7 +400,7 @@ stopping before FFmpeg's own build so the configured source tree survives).
   rtol 1e-3 *because of* F16 precision loss. If that happens, the artifact
   name, size and tolerance get revisited then, deliberately, rather than
   drifting now.
-- **`ggml_pad_ext` (Ruling 5 probe) = exists.** Signature:
+- **`ggml_pad_ext` (probed) = exists.** Signature:
   `ggml_pad_ext(ctx, a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3)` — zero-pads
   each of the 4 dimensions independently on the left and right. This is a
   native per-side padding op, unlike `ggml_pad`/`ggml_pad_circular`
