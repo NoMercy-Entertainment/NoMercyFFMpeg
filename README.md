@@ -199,21 +199,17 @@ statically linked into every platform binary for the `whisper` filter, so
 
 ```bash
 # Karaoke: instrumental only, plain -af
-ffmpeg -i song.flac -af "stemsplit=model=2stems.gguf:stem=accompaniment,asetnsamples=n=4096" karaoke.flac
+ffmpeg -i song.flac -af "stemsplit=model=2stems.gguf:stem=accompaniment" karaoke.flac
 
 # Both stems, one filtergraph with two outputs
 ffmpeg -i song.flac -filter_complex \
-  "[0:a]stemsplit=model=2stems.gguf:stem=all[v][a];[v]asetnsamples=n=4096[vo];[a]asetnsamples=n=4096[ao]" \
-  -map "[vo]" vocals.flac -map "[ao]" music.flac
+  "[0:a]stemsplit=model=2stems.gguf:stem=all[v][a]" \
+  -map "[v]" vocals.flac -map "[a]" music.flac
 ```
 
-`stemsplit` emits one large frame per ~11.9 s segment (524,288 samples, or
-520,192 on the first segment after the lead-in crop) rather than a stream of
-small frames — most encoders don't mind, but FLAC's block size is capped at
-65,535 samples and rejects it outright (`invalid block size`). The
-`asetnsamples=n=4096` above rechunks the output before the FLAC encoder sees
-it; drop it if you're encoding to a format without a block-size ceiling
-(e.g. WAV/PCM).
+`stemsplit` emits one 1024-sample frame per STFT hop, so its output is
+encoder-friendly everywhere — including formats with a block-size ceiling,
+such as FLAC's 65,535 samples. No rechunking filter is needed.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -236,8 +232,8 @@ oversight. Throughput on 16 threads of a modern desktop CPU is roughly
 **1.8x realtime** for the `2stems` pair (about 0.11x realtime per core,
 since ggml's own kernels — not a BLAS gemm — drive the convolutions here):
 a four-minute track takes a little over two minutes to separate on such a
-machine. Peak resident memory is about **194 MiB**, rising to about
-**211 MiB** with `overlap` set non-zero. This makes it a good fit for a
+machine. Peak resident memory is about **194 MiB** for `stem=all`, rising
+somewhat with `overlap` set non-zero. This makes it a good fit for a
 media server pre-generating karaoke tracks on library scan, not for
 real-time use.
 

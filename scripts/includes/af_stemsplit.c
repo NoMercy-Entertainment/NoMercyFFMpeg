@@ -322,8 +322,10 @@ static void ss_analyze(StemSplitContext *s, const float *in, AVComplexFloat *out
 
 /* `in` is SS_BINS complex bins; windows the inverse transform's real output
  * a second time, scales by the Hann/75%-overlap reconstruction gain, and
- * overlap-adds into `ola` starting at `offset`. */
-static void ss_synthesize(StemSplitContext *s, const AVComplexFloat *in, float *ola, int offset)
+ * overlap-adds the whole SS_FRAME_LENGTH result into `ola`. The caller slides
+ * `ola` by one hop after each frame (ss_emit_frames), so synthesis always
+ * starts at its origin. */
+static void ss_synthesize(StemSplitContext *s, const AVComplexFloat *in, float *ola)
 {
     /* The inverse RDFT overwrites its input (libavutil/tx.h), so hand it a
      * scratch copy rather than the caller's (possibly shared) spectrum. */
@@ -331,7 +333,7 @@ static void ss_synthesize(StemSplitContext *s, const AVComplexFloat *in, float *
     s->tx_inv_fn(s->tx_inv, s->in_buf, s->spec, sizeof(*s->spec));
 
     for (int n = 0; n < SS_FRAME_LENGTH; n++)
-        ola[offset + n] += s->window[n] * s->in_buf[n] * SS_WINDOW_COMPENSATION;
+        ola[n] += s->window[n] * s->in_buf[n] * SS_WINDOW_COMPENSATION;
 }
 
 /* ---- Model loading (Task 6) ----------------------------------------------
@@ -1593,6 +1595,17 @@ static int ss_process_segment(AVFilterContext *ctx)
     const float *est_p[SS_NB_INSTRUMENTS];
     int c, j, f, i, ret;
 
+    /* ss_build_masks() writes s->mask indexed by SEGMENT-RELATIVE frame j,
+     * while ss_emit_frames() reads it back indexed by RING SLOT. Those are the
+     * same index only because at overlap=0 hop_frames == SS_T, which makes
+     * base a multiple of SS_T and so slot == (base + j) % SS_T == j. With
+     * overlap the two disagree, and the mask_acc ring below -- which IS
+     * slot-indexed -- is what ss_emit_frames reads instead. Assert the
+     * condition rather than trust it: if a future change ever lets hop_frames
+     * differ from SS_T at overlap 0, the mask would be silently read from the
+     * wrong frame, which sounds like smearing and raises no error. */
+    av_assert0(s->overlap_frames > 0 || base % SS_T == 0);
+
     for (c = 0; c < SS_CHANNELS; c++)
         for (j = 0; j < SS_T; j++) {
             const AVComplexFloat *row = s->spec_ring +
@@ -1657,13 +1670,30 @@ static int ss_process_segment(AVFilterContext *ctx)
  * A sample s takes contributions from every frame t with
  * t*STEP <= s < t*STEP + LENGTH, so once frame t has been added, everything
  * below (t+1)*STEP is final: exactly one hop per frame, which is why the
- * accumulator only needs to be one frame long. */
+ * accumulator only needs to be one frame long.
+ *
+ * ONE AVFrame IS EMITTED PER RETIRED STFT FRAME -- SS_FRAME_STEP samples --
+ * not one concatenated buffer per segment. Concatenating produced 520,192-
+ * and 524,288-sample frames, and FLAC rejects those outright ("invalid block
+ * size"; its ceiling is 65,535). Capping the size has to happen here because
+ * libavfilter offers a filter no way to declare or discover a downstream
+ * preference: FLAC, ALAC, WavPack, TTA and Monkey's Audio all declare
+ * AV_CODEC_CAP_VARIABLE_FRAME_SIZE, so ffmpeg does not auto-reframe them;
+ * av_buffersink_set_frame_size is called by the CLI only for encoders with a
+ * fixed frame size; and min_samples/max_samples govern a filter's INPUT, not
+ * its output. The loop below always produced exactly one hop per iteration --
+ * that granularity was simply being concatenated away.
+ *
+ * The chunk boundaries land where they should. The lead-in crop is
+ * SS_FRAME_LENGTH == 4 * SS_FRAME_STEP, a whole number of hops, so it skips
+ * whole frames and never splits one. The only short frame is the last, where
+ * s->flushing truncates the zero-padded tail back to the true sample count --
+ * exactly where a short frame belongs.
+ */
 static int ss_emit_frames(AVFilterContext *ctx, int nb_frames)
 {
     StemSplitContext *s = ctx->priv;
-    const int64_t total = (int64_t) nb_frames * SS_FRAME_STEP;
     AVFrame *out[SS_NB_INSTRUMENTS] = { NULL };
-    int64_t skip, to_emit, written = 0, pts;
     int j, c, fi, b, ret = 0;
 
     if (nb_frames <= 0)
@@ -1673,36 +1703,20 @@ static int ss_emit_frames(AVFilterContext *ctx, int nb_frames)
      * is the maximum ss_append_outputs can produce. */
     av_assert0(ctx->nb_outputs <= SS_NB_INSTRUMENTS);
 
-    /* Step 9's crop: drop the lead-in the analysis window prepended. */
-    skip = FFMIN(s->crop_remaining, total);
-    s->crop_remaining -= skip;
-    to_emit = total - skip;
-
-    /* At EOF the last segment was zero-padded to a full SS_T frames; the pad
-     * must not reach the output, so the true sample count caps it. */
-    if (s->flushing)
-        to_emit = FFMIN(to_emit, FFMAX(s->total_in - s->emitted, 0));
-
-    if (to_emit > 0) {
-        for (j = 0; j < ctx->nb_outputs; j++) {
-            if (ff_outlink_get_status(ctx->outputs[j]))
-                continue;   /* downstream is gone; keep processing, drop output */
-            out[j] = ff_get_audio_buffer(ctx->outputs[j], (int) to_emit);
-            if (!out[j]) {
-                ret = AVERROR(ENOMEM);
-                goto fail;
-            }
-        }
-    }
-
     for (fi = 0; fi < nb_frames; fi++) {
         const int slot = (int) (s->frames_done % SS_T);
         const float inv_w = s->overlap_frames > 0 ? 1.0f / s->w_acc[slot] : 1.0f;
-        int64_t dst = written - skip;
         int src_off = 0, n = SS_FRAME_STEP;
 
         for (j = 0; j < ctx->nb_outputs; j++) {
             const int inst = s->out_inst[j];
+            /* At overlap=0 this reads s->mask by RING SLOT even though
+             * ss_build_masks wrote it by SEGMENT-RELATIVE frame. The two
+             * indices coincide only because hop_frames == SS_T there, which
+             * makes every segment start on a multiple of SS_T -- the invariant
+             * ss_process_segment asserts. With overlap they differ, and the
+             * mask_acc ring, which is slot-indexed by construction, carries
+             * the blended masks instead. */
             const float *m_base = s->overlap_frames > 0 ? s->mask_acc[inst]
                                                          : s->mask[inst];
 
@@ -1717,26 +1731,51 @@ static int ss_emit_frames(AVFilterContext *ctx, int nb_frames)
                     s->work_spec[b].re = spec[b].re * gain;
                     s->work_spec[b].im = spec[b].im * gain;
                 }
-                ss_synthesize(s, s->work_spec, s->ola[j][c], 0);
+                ss_synthesize(s, s->work_spec, s->ola[j][c]);
             }
         }
 
-        if (dst < 0) {
-            src_off = (int) FFMIN(-dst, (int64_t) SS_FRAME_STEP);
-            n      -= src_off;
-            dst     = 0;
+        /* Step 9's crop: drop the lead-in the analysis window prepended. */
+        if (s->crop_remaining > 0) {
+            const int skip = (int) FFMIN(s->crop_remaining, (int64_t) n);
+
+            s->crop_remaining -= skip;
+            src_off += skip;
+            n       -= skip;
         }
-        if (n > 0 && dst < to_emit) {
-            n = (int) FFMIN((int64_t) n, to_emit - dst);
+
+        /* At EOF the last segment was zero-padded to a full SS_T frames; the
+         * pad must not reach the output, so the true sample count caps it. */
+        if (s->flushing)
+            n = (int) FFMIN((int64_t) n, FFMAX(s->total_in - s->emitted, 0));
+
+        if (n > 0) {
+            const int64_t pts = s->next_pts;
+            const int64_t dur = av_rescale_q(n, (AVRational) { 1, SS_SAMPLE_RATE },
+                                             ctx->outputs[0]->time_base);
+
             for (j = 0; j < ctx->nb_outputs; j++) {
-                if (!out[j])
-                    continue;
+                if (ff_outlink_get_status(ctx->outputs[j]))
+                    continue;   /* downstream is gone; keep processing, drop output */
+                out[j] = ff_get_audio_buffer(ctx->outputs[j], n);
+                if (!out[j]) {
+                    ret = AVERROR(ENOMEM);
+                    goto fail;
+                }
                 for (c = 0; c < SS_CHANNELS; c++)
-                    memcpy((float *) out[j]->extended_data[c] + dst,
-                           s->ola[j][c] + src_off, n * sizeof(float));
+                    memcpy(out[j]->extended_data[c], s->ola[j][c] + src_off,
+                           n * sizeof(float));
+                out[j]->pts      = pts;
+                out[j]->duration = dur;
             }
+
+            if (s->next_pts != AV_NOPTS_VALUE)
+                s->next_pts += dur;
+            s->emitted += n;
         }
 
+        /* Slide each accumulator by one hop and zero the tail that exposes,
+         * ready for the next frame's overlap-add. */
         for (j = 0; j < ctx->nb_outputs; j++)
             for (c = 0; c < SS_CHANNELS; c++) {
                 float *o = s->ola[j][c];
@@ -1747,29 +1786,18 @@ static int ss_emit_frames(AVFilterContext *ctx, int nb_frames)
                        SS_FRAME_STEP * sizeof(float));
             }
 
-        written += SS_FRAME_STEP;
         s->frames_done++;
-    }
 
-    if (to_emit <= 0)
-        return 0;
+        for (j = 0; j < ctx->nb_outputs; j++) {
+            AVFrame *frame = out[j];
 
-    pts = s->next_pts;
-    if (s->next_pts != AV_NOPTS_VALUE)
-        s->next_pts += av_rescale_q(to_emit, (AVRational) { 1, SS_SAMPLE_RATE },
-                                    ctx->outputs[0]->time_base);
-    s->emitted += to_emit;
-
-    for (j = 0; j < ctx->nb_outputs; j++) {
-        AVFrame *frame = out[j];
-
-        if (!frame)
-            continue;
-        out[j] = NULL;
-        frame->pts = pts;
-        ret = ff_filter_frame(ctx->outputs[j], frame);
-        if (ret < 0)
-            goto fail;
+            if (!frame)
+                continue;
+            out[j] = NULL;
+            ret = ff_filter_frame(ctx->outputs[j], frame);
+            if (ret < 0)
+                goto fail;
+        }
     }
 
     return 0;
