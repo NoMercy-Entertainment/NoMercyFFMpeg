@@ -143,15 +143,19 @@ typedef struct StemSplitContext {
 
     /* STFT / inverse STFT (Task 5): a 4096-point av_tx real DFT pair at hop
      * 1024, with a periodic Hann window applied on both analysis and
-     * synthesis. window/in_buf/ola_buf/spec are scratch owned by the
-     * context so ss_analyze()/ss_synthesize() don't allocate per call. */
+     * synthesis. window/in_buf/spec are scratch owned by the context so
+     * ss_analyze()/ss_synthesize() don't allocate per call.
+     *
+     * There is deliberately no overlap-add accumulator here. Synthesis writes
+     * into a caller-supplied accumulator instead -- s->ola[pad][channel], one
+     * per output pad, owned by the segment driver -- because the number of
+     * accumulators depends on how many output pads `stem` produced, which the
+     * DSP layer knows nothing about. */
     AVTXContext    *tx_fwd, *tx_inv;
     av_tx_fn        tx_fwd_fn, tx_inv_fn;
     float          *window;   /* SS_FRAME_LENGTH, periodic Hann */
     float          *in_buf;   /* SS_FRAME_LENGTH scratch: windowed real input
                                 * for analysis, real ifft output for synthesis */
-    float          *ola_buf;  /* SS_CHANNELS * SS_FRAME_LENGTH overlap-add
-                                * accumulator, channel c at ola_buf + c*SS_FRAME_LENGTH */
     AVComplexFloat *spec;     /* SS_BINS scratch: mutable copy of the spectrum
                                 * ss_synthesize() hands to the inverse transform,
                                 * which overwrites its input */
@@ -162,14 +166,6 @@ typedef struct StemSplitContext {
                                                * created by gguf_init_from_file with
                                                * no_alloc=false, freed in ss_model_free */
     struct ggml_backend        *backend;     /* CPU backend */
-    struct ggml_backend_buffer *weights_buf; /* unused for now: no_alloc=false already
-                                               * backs every weight tensor with plain
-                                               * host memory inside gguf_ctx, so there is
-                                               * nothing for a backend buffer to own on
-                                               * the CPU-only backend this project ships.
-                                               * Kept so the field exists if a future
-                                               * backend needs it (ss_model_free frees it
-                                               * if ever non-NULL). */
     SSNet    nets[SS_NB_INSTRUMENTS];
     int      nb_instruments;
     char    *instrument_names[SS_NB_INSTRUMENTS];
@@ -280,8 +276,7 @@ static int ss_dsp_init(AVFilterContext *ctx)
     s->window  = av_malloc_array(SS_FRAME_LENGTH, sizeof(*s->window));
     s->in_buf  = av_malloc_array(SS_FRAME_LENGTH, sizeof(*s->in_buf));
     s->spec    = av_malloc_array(SS_BINS, sizeof(*s->spec));
-    s->ola_buf = av_calloc(SS_CHANNELS * SS_FRAME_LENGTH, sizeof(*s->ola_buf));
-    if (!s->window || !s->in_buf || !s->spec || !s->ola_buf)
+    if (!s->window || !s->in_buf || !s->spec)
         return AVERROR(ENOMEM);
 
     /* Periodic Hann, matching tf.signal.hann_window(periodic=True): divide
@@ -307,7 +302,6 @@ static void ss_dsp_free(StemSplitContext *s)
     av_freep(&s->window);
     av_freep(&s->in_buf);
     av_freep(&s->spec);
-    av_freep(&s->ola_buf);
 }
 
 /* `in` is SS_FRAME_LENGTH samples of one channel; `out` receives SS_BINS
@@ -566,10 +560,6 @@ static void ss_model_free(StemSplitContext *s)
         ggml_backend_free(s->backend);
     s->backend = NULL;
 
-    if (s->weights_buf)
-        ggml_backend_buffer_free(s->weights_buf);
-    s->weights_buf = NULL;
-
     if (s->gguf_ctx)
         ggml_free(s->gguf_ctx);
     s->gguf_ctx = NULL;
@@ -583,6 +573,38 @@ static void ss_model_free(StemSplitContext *s)
     memset(s->nets, 0, sizeof(s->nets));
 }
 
+/* Defined with the compute graph further down; declared here because
+ * ss_model_load() must tear the graph down before it frees the weights the
+ * graph's tensors point into. */
+static void ss_graph_free(StemSplitContext *s);
+
+/* Instrument names come out of the model file and are used to build
+ * filesystem paths (ss_dump_tensor), filtergraph pad labels
+ * (ss_append_outputs) and tensor names (ss_resolve_layer), so they are
+ * untrusted input reaching three interfaces that all attach meaning to
+ * punctuation. Restrict them to [A-Za-z0-9_-], 1..31 characters: long enough
+ * for any plausible stem name, short enough that SS_NB_INSTRUMENTS of them
+ * always fit in ss_join_instruments' buffer, and narrow enough that '/', '\'
+ * and ".." can never appear. A model naming a stem "../../../etc/x" would
+ * otherwise have ss_dump_tensor write outside the `dump` directory. */
+static int ss_valid_instrument_name(const char *name)
+{
+    size_t len = strlen(name);
+    size_t i;
+
+    if (len < 1 || len > 31)
+        return 0;
+    for (i = 0; i < len; i++) {
+        const char c = name[i];
+
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return 0;
+    }
+
+    return 1;
+}
+
 static int ss_model_load(AVFilterContext *ctx)
 {
     StemSplitContext *s = ctx->priv;
@@ -591,15 +613,28 @@ static int ss_model_load(AVFilterContext *ctx)
     int64_t key;
     size_t n_inst;
     const char *arch;
-    char avail[SS_NB_INSTRUMENTS * 32];
+    /* 34 per instrument: 31 name characters (ss_valid_instrument_name's cap),
+     * ", " and the terminator, so a validated instrument list never has to be
+     * truncated into an error message. */
+    char avail[SS_NB_INSTRUMENTS * 34];
     int k, n, i;
     int ret;
 
     /* Defensive idempotency: no known FFmpeg path calls ss_model_load()
      * twice on a live context, but if one ever does, s->backend, s->gguf_ctx
      * and s->instrument_names[] would each be silently overwritten and
-     * leaked rather than freed. Make "a load always starts from a clean
-     * slate" an explicit invariant instead of an implicit assumption. */
+     * leaked rather than freed.
+     *
+     * The graph goes first, and the order is load-bearing rather than
+     * cosmetic: every tensor in s->graph_ctx (g_input, g_raw, g_up, g_est,
+     * g_mask) points at weight data owned by s->gguf_ctx, which ss_model_free
+     * releases. Freeing only the model would leave a live graph of dangling
+     * weight pointers, and the next ss_infer() would compute through freed
+     * memory instead of failing. This is uninit()'s ordering, for the same
+     * reason. Together the two calls make "a load always starts from a clean
+     * slate, with nothing left pointing into the old one" true rather than
+     * merely intended. */
+    ss_graph_free(s);
     ss_model_free(s);
 
     /* Bridge ggml's own log output (including gguf_init_from_file's
@@ -675,6 +710,18 @@ static int ss_model_load(AVFilterContext *ctx)
         s->instrument_names[i] = av_strdup(gguf_get_arr_str(gguf, key, i));
         if (!s->instrument_names[i]) {
             ret = AVERROR(ENOMEM);
+            goto done;
+        }
+    }
+    for (i = 0; i < SS_NB_INSTRUMENTS; i++) {
+        if (!ss_valid_instrument_name(s->instrument_names[i])) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Model '%s' names instrument %d '%s'. Instrument names "
+                   "become output pad labels and dump file names, so they "
+                   "are restricted to 1 to 31 characters of "
+                   "[A-Za-z0-9_-].\n",
+                   s->model_path, i, s->instrument_names[i]);
+            ret = AVERROR(EINVAL);
             goto done;
         }
     }
@@ -1957,10 +2004,22 @@ static int ss_driver_init(AVFilterContext *ctx)
      * know that a segment is 512 STFT frames of 1024 samples to ask for a
      * second and a half of crossfade. The conversion lives here, where the
      * arithmetic is. */
-    s->overlap_frames = (int) av_clip64(av_rescale(s->overlap, SS_SAMPLE_RATE,
-                                                   AV_TIME_BASE) / SS_FRAME_STEP,
-                                        0, SS_T - 1);
+    const int64_t want_frames = av_rescale(s->overlap, SS_SAMPLE_RATE,
+                                           AV_TIME_BASE) / SS_FRAME_STEP;
+
+    s->overlap_frames = (int) av_clip64(want_frames, 0, SS_T - 1);
     s->hop_frames = SS_T - s->overlap_frames;
+
+    /* The option accepts up to 60 s, but a segment is only SS_T frames long,
+     * so anything past SS_T-1 frames (~11.86 s) is silently the same request.
+     * Say so rather than let a user believe overlap=30 did something. */
+    if (want_frames > s->overlap_frames)
+        av_log(ctx, AV_LOG_WARNING,
+               "stemsplit: overlap of %.3f s exceeds the %.3f s maximum "
+               "(a segment is %d frames); clamping to %.3f s.\n",
+               s->overlap / (double) AV_TIME_BASE,
+               (double) (SS_T - 1) * SS_FRAME_STEP / SS_SAMPLE_RATE, SS_T,
+               (double) s->overlap_frames * SS_FRAME_STEP / SS_SAMPLE_RATE);
 
     for (c = 0; c < SS_CHANNELS; c++) {
         s->an_window[c] = av_calloc(SS_FRAME_LENGTH, sizeof(float));
@@ -2171,8 +2230,16 @@ static int ss_filter_frame(AVFilterContext *ctx, AVFrame *frame)
     StemSplitContext *s = ctx->priv;
     int ret;
 
+    /* s->next_pts is advanced in the OUTPUT link's time base (ss_emit_frames),
+     * so seed it in that base too. Both are 1/44100 today because
+     * query_formats pins the sample rate, but that is a coincidence of the
+     * current format negotiation rather than something this line should
+     * assume. */
     if (s->next_pts == AV_NOPTS_VALUE)
-        s->next_pts = frame->pts != AV_NOPTS_VALUE ? frame->pts : 0;
+        s->next_pts = frame->pts != AV_NOPTS_VALUE
+                    ? av_rescale_q(frame->pts, ctx->inputs[0]->time_base,
+                                   ctx->outputs[0]->time_base)
+                    : 0;
 
     /* Parity hook: the network has already been measured against the injected
      * spectrogram in init(); the audio itself is of no interest. */
