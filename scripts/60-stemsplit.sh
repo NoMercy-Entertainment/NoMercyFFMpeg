@@ -58,16 +58,25 @@ fi
 # 3. Add filter to the configure script
 log "Step 3: Adding filter dependencies to configure script"
 
-if ! grep -q "stemsplit_filter_deps" /build/ffmpeg/configure; then
+DEPS="whisper swresample"
+
+if grep -q "^stemsplit_filter_deps=\"${DEPS}\"$" /build/ffmpeg/configure; then
+    log "  \u2713 Filter dependencies already correct"
+elif grep -q "^stemsplit_filter_deps=" /build/ffmpeg/configure; then
+    # An older run wrote a shorter list. swresample is what lets the filter
+    # accept any sample rate and channel count and hand the stems back in the
+    # input's own format; without it the line declares a filter that is
+    # missing a dependency.
+    sed -i "s|^stemsplit_filter_deps=.*|stemsplit_filter_deps=\"${DEPS}\"|" /build/ffmpeg/configure
+    log "  \u2713 Updated filter dependencies"
+else
     # Anchored after whisper_filter_deps (the last audio-filter dep line
     # before the "# examples" section in FFmpeg 9.0's configure) rather than
     # the brief's abench_filter_deps anchor, which no longer exists in this
     # tree. whisper is also the filter stemsplit's own dep is borrowed from,
     # so the two lines sitting together is the more natural spot anyway.
-    sed -i '/^whisper_filter_deps=/a stemsplit_filter_deps="whisper"' /build/ffmpeg/configure
+    sed -i "/^whisper_filter_deps=/a stemsplit_filter_deps=\"${DEPS}\"" /build/ffmpeg/configure
     log "  ✓ Added filter dependencies"
-else
-    log "  ✓ Filter dependencies already exist"
 fi
 
 # Verify

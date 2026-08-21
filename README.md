@@ -215,9 +215,35 @@ such as FLAC's 65,535 samples. No rechunking filter is needed.
 |---|---|---|---|
 | `model` | string | *required* | Path to the `.gguf` model file |
 | `stem` | enum | `all` | `vocals`, `accompaniment`, or `all` (one output pad per stem) |
-| `highband` | enum | `passthrough` | `passthrough` routes the mixture's untouched high band (>11 025 Hz) into the last stem instead of silencing it, an improvement over stock Spleeter's muffled output; `zeros` reproduces upstream Spleeter bit-for-bit; `average` tiles each frame's mean mask across the high band |
+| `highband` | enum | `extend` | How to handle the band above 11 025 Hz, which the network does not see. `extend` carries each stem's own mask at the top of the modelled band upward, crossfaded in; `passthrough` routes the untouched high band into the last stem; `zeros` reproduces upstream Spleeter bit-for-bit; `average` tiles each frame's mean mask across the band |
+| `exponent` | float | `2` | Separation exponent. 2 is the released Spleeter configuration; lower is a softer split, higher a harder one |
+| `bleed` | float | `0` | Smallest share of the mixture every stem keeps in any bin. Fills the deepest spectral holes; it is **not** a cure for ducking |
+| `smooth` | int | `0` | Smooth the masks over this many frequency bins either side |
 | `overlap` | duration | `0` | Crossfade between segments (e.g. `5`, `1.5`, `00:00:05.000`); `0` matches reference Spleeter's un-overlapped chunking |
 | `threads` | int | `0` | ggml CPU threads; `0` uses the filter's default |
+
+**Why `extend` is the default.** `passthrough` was, until it was measured. It
+loses nothing, but it hands *all* the unmodelled energy to one stem
+unconditionally — and just under the edge the vocal network has usually claimed
+nearly everything, so the accompaniment's spectrum steps *up* as it crosses
+11 025 Hz. On a piano-and-voice ballad that step measures **+14.0 dB**; a bright
+band with nothing underneath it, over a body that ducks whenever the singer
+sings, is what gets reported as a whistle and a fader. Under `extend` the same
+measurement is **−0.4 dB**.
+
+The vocal stem gains more than the accompaniment does: under every other mode
+it is hard-cut at 11 kHz, so its sibilance and breath are simply absent.
+`extend` puts about **38 dB** of 11–14 kHz and **51 dB** of 14–18 kHz back into
+it, while changing nothing inside the modelled band.
+
+**Any rate, any channel count, in and out.** The network is a 44.1 kHz stereo
+model, so anything else is converted to that on the way in and back to the
+input's own rate and layout on the way out — a 24-bit 96 kHz file produces
+24-bit 96 kHz stems. 44.1 kHz two-channel audio takes neither conversion and
+runs the path unchanged. Two consequences worth knowing: a hi-res file keeps
+its rate but not its top octave, because the separation happened at 44.1 kHz;
+and more than two channels is folded to stereo for the network and upmixed
+back, which the filter logs as a warning.
 
 **Model:** `spleeter-2stems-f16.gguf` (39,319,552 bytes) is published as a
 GitHub release asset on this repository, downloaded the same way whisper's

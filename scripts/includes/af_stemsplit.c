@@ -33,6 +33,12 @@
  * them to the ORIGINAL complex mixture spectrum -- the mixture's phase is
  * reused unchanged -- and resynthesises one stem per output pad.
  *
+ * Input of any sample rate and any channel count is accepted. 44.1 kHz stereo
+ * -- the rate and layout the network was trained at -- runs through untouched;
+ * anything else is resampled to it on the way in and back to the input's own
+ * rate and layout on the way out (ss_rs_*), so a 24-bit 96 kHz file comes back
+ * out 24-bit and 96 kHz instead of silently becoming a 44.1 kHz one.
+ *
  * `debug_input` remains an internal parity hook: it injects a spectrogram
  * straight from disk, runs the networks on it once and dumps every layer tap
  * for the per-layer comparison of design section 9.2. It bypasses the audio
@@ -58,6 +64,7 @@
 #include "libavutil/samplefmt.h"
 #include "libavutil/mem.h"
 #include "libavutil/tx.h"
+#include "libswresample/swresample.h"
 #include "libavfilter/avfilter.h"
 #include "libavfilter/audio.h"
 #include "libavfilter/filters.h"
@@ -84,8 +91,27 @@
  * aligned base. The padding bins are never read. */
 #define SS_SPEC_STRIDE  FFALIGN(SS_BINS, 8)
 
+/* highband=extend: how many of the modelled bins the plateau is measured over,
+ * and how many bins the crossfade from the last real bin into that plateau
+ * spans. 160 bins is about 1.7 kHz of context below the 11.025 kHz edge --
+ * enough to be a stable estimate of "what does this frame do up here", short
+ * enough to still be about the top of the band rather than the whole of it.
+ * The 96-bin (about 1 kHz) crossfade is what turns the edge from a step into a
+ * ramp.
+ *
+ * Measured end to end, as the accompaniment's level relative to the mixture in
+ * 11.025-14 kHz minus the same figure in 8-11.025 kHz, over 60 s each: a
+ * piano-and-voice ballad steps +33.6 dB under `passthrough` and +7.6 dB under
+ * `extend`; a dense pop production, +8.1 dB and +1.8 dB. */
+#define SS_HB_TAIL      160
+#define SS_HB_XFADE     96
+/* Bins the plateau is blended in from -- the mask's own value at the very top
+ * of the modelled band, averaged over a few bins so one noisy bin cannot set
+ * the whole high band. */
+#define SS_HB_EDGE      8
+
 enum { SS_STEM_VOCALS, SS_STEM_ACCOMPANIMENT, SS_STEM_ALL };
-enum { SS_HB_PASSTHROUGH, SS_HB_ZEROS, SS_HB_AVERAGE };
+enum { SS_HB_PASSTHROUGH, SS_HB_ZEROS, SS_HB_AVERAGE, SS_HB_EXTEND };
 
 /* Index into a per-segment mask: [C][T][SS_BINS] float, bin fastest. The
  * network's own tensors are [C][T][SS_F] instead -- the model only predicts
@@ -136,6 +162,9 @@ typedef struct StemSplitContext {
     char    *model_path;
     int      stem;
     int      highband;
+    float    exponent;
+    float    bleed;
+    int      smooth;
     int64_t  overlap;
     int      nb_threads;
     char    *dump_dir;
@@ -234,25 +263,64 @@ typedef struct StemSplitContext {
     int      started;        /* the zero lead-in frame has been pushed */
     int      flushing;       /* inside the EOF drain: cap output at total_in */
 
+    /* ---- Rate / layout adaptation ---------------------------------------
+     *
+     * The network is a 44.1 kHz stereo model and the whole segment driver
+     * above is written in those terms. Rather than teach the driver about
+     * other rates, the filter converts at its edges: `swr_in` folds whatever
+     * arrives into 44.1 kHz stereo, and one `swr_out` per output pad puts each
+     * finished stem back into the input's own rate and layout. `resampling`
+     * is 0 for 44.1 kHz stereo input, and then neither context exists and the
+     * sample path is exactly what it was before this existed.
+     *
+     * Length is accounted in NATIVE samples (total_in_native / emitted_native)
+     * as well as in the internal 44.1 kHz ones, because the two resamplers
+     * each carry their own delay and their round trip is only accurate to a
+     * few samples. The native counters are what make the output exactly as
+     * long as the input; the 44.1 kHz ones drive the segment machinery. */
+    int      resampling;
+    int      out_rate;
+    AVChannelLayout out_layout;
+    struct SwrContext *swr_in;
+    struct SwrContext *swr_out[SS_NB_INSTRUMENTS];
+    uint8_t **rs_data;               /* scratch: swr_in's 44.1 kHz stereo output */
+    int      rs_nb_samples;          /* capacity of rs_data, in samples */
+    int64_t  total_in_native;        /* input samples at the input's own rate */
+    int64_t  emitted_native;         /* output samples emitted at that rate */
+
+    /* SS_BINS scratch for the `smooth` box filter; NULL when smooth == 0. */
+    float   *smooth_buf;
+
     int      eof;
     int      status;
     int64_t  next_pts;
 } StemSplitContext;
 
+/* Planar float is the only sample format the STFT wants to see; everything
+ * else is negotiated as "whatever the input is". The `_all_` forms still put
+ * ONE shared list on both sides of the filter, so the output pads inherit the
+ * input's rate and layout rather than being free to disagree with it -- which
+ * is exactly the contract this filter now offers: the stems come back in the
+ * format the mixture arrived in.
+ *
+ * The network itself is unmoved by any of this. It is a 44.1 kHz stereo model
+ * and it always will be; ss_config_input puts a resampler on each side of the
+ * segment driver when the negotiated format is not that. Pinning the rate here
+ * instead -- which is what this did before, and what af_whisper still does --
+ * makes FFmpeg insert the same resampling one link further out, with the
+ * difference that the downsampled rate then leaks into the output file. */
 static int query_formats(const AVFilterContext *ctx,
                          AVFilterFormatsConfig **cfg_in,
                          AVFilterFormatsConfig **cfg_out)
 {
     static const enum AVSampleFormat sample_fmts[] = { AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_NONE };
-    AVChannelLayout chlayouts[] = { AV_CHANNEL_LAYOUT_STEREO, { 0 } };
-    int sample_rates[] = { SS_SAMPLE_RATE, -1 };
     int ret;
 
     if ((ret = ff_set_common_formats_from_list2(ctx, cfg_in, cfg_out, sample_fmts)) < 0)
         return ret;
-    if ((ret = ff_set_common_channel_layouts_from_list2(ctx, cfg_in, cfg_out, chlayouts)) < 0)
+    if ((ret = ff_set_common_all_channel_counts2(ctx, cfg_in, cfg_out)) < 0)
         return ret;
-    return ff_set_common_samplerates_from_list2(ctx, cfg_in, cfg_out, sample_rates);
+    return ff_set_common_all_samplerates2(ctx, cfg_in, cfg_out);
 }
 
 /* ---- STFT / inverse STFT ------------------------------------------------
@@ -1529,37 +1597,157 @@ done:
  *
  * Design section 4.2 step 5, reproduced exactly:
  *
- *     output_sum = sum_j (S_j ^ 2) + EPSILON
- *     mask_i     = (S_i ^ 2 + EPSILON / N) / output_sum
+ *     output_sum = sum_j (S_j ^ p) + EPSILON
+ *     mask_i     = (S_i ^ p + EPSILON / N) / output_sum
  *
  * EPSILON appears TWICE with different scaling -- whole in the denominator,
  * divided by N in the numerator. That is upstream Spleeter's formula, not a
  * typo, and it is what makes the masks sum to exactly 1 when every estimate is
  * zero (silence) instead of 0/0. Do not "simplify" the two terms into one.
  *
- * The separation exponent is 2, so S_i^2 is written out rather than reached
- * through powf: a fixed exponent of 2 is the released 2stems configuration.
+ * p is the `exponent` option and defaults to 2, the released 2stems
+ * configuration. p == 2 is special-cased to a multiply, so the default path
+ * costs no powf() and stays bit-identical to what this computed before the
+ * option existed. Lowering p softens the split -- more of the other stem
+ * bleeds through, fewer masking artifacts -- and raising it hardens it.
  *
  * Above bin SS_F (11 025 Hz) the network predicts nothing at all, so the mask
  * there is a policy decision rather than a computation -- design section 7.
+ *
+ * `smooth` and `bleed` are both LINEAR in the per-instrument masks and apply
+ * the same coefficients to all of them, so the masks still sum to exactly 1
+ * afterwards and the stems still sum back to the mixture. That is not a
+ * nicety: it is the property tests/check_stems.py asserts, and it is why they
+ * are a box filter and a blend toward uniform rather than a clamp followed by
+ * a renormalisation, which would not have it.
+ *
+ * The `highband` switch is the one place that can break the sum, and exactly
+ * one of its modes does: SS_HB_ZEROS sets every instrument's mask to 0 above
+ * SS_F, so above 11.025 kHz they sum to 0 rather than 1 and the stems are
+ * short of the mixture by whatever it had up there. That is the mode's whole
+ * purpose -- it is upstream Spleeter's behaviour, kept for A/B -- so the test
+ * checks that mode's identity below the edge instead of dropping it.
  */
+
+/* Box-filters one (channel, frame)'s mask along frequency with radius
+ * s->smooth, in place, through a running sum.
+ *
+ * Isolated single-bin mask spikes are what "musical noise" -- the chirping
+ * around a separated vocal -- is made of; widening each mask decision over its
+ * neighbours trades a little separation for fewer of them. Off by default,
+ * because on measured material a radius of 1 costs about 10 dB of vocal
+ * rejection in the accompaniment for no improvement any metric here can see.
+ * It is a knob for ears, not for numbers. */
+static void ss_smooth_band(StemSplitContext *s, float *m)
+{
+    const int r = s->smooth;
+    const int w = 2 * r + 1;
+    float *tmp = s->smooth_buf;
+    double acc = 0.0;
+    int f;
+
+    memcpy(tmp, m, SS_BINS * sizeof(float));
+
+    /* Edge-clamped, so the window is always w wide and the filter stays a
+     * plain average. A window that shrank at the edges would still be linear
+     * but would weight the instruments' masks differently there, and the sum
+     * this whole file relies on would stop being 1 in the last few bins. */
+    for (f = -r; f <= r; f++)
+        acc += tmp[av_clip(f, 0, SS_BINS - 1)];
+
+    for (f = 0; f < SS_BINS; f++) {
+        m[f] = (float) (acc / w);
+        acc -= tmp[av_clip(f - r, 0, SS_BINS - 1)];
+        acc += tmp[av_clip(f + r + 1, 0, SS_BINS - 1)];
+    }
+}
+
+/* Fills bins [SS_F, SS_BINS) of one (channel, frame)'s mask for SS_HB_EXTEND.
+ *
+ * `mag` is that frame's mixture magnitude over the modelled bins -- the
+ * network's own input -- and weights the plateau estimate. */
+static void ss_extend_band(StemSplitContext *s, float *m, const float *mag)
+{
+    float *hi = m + SS_F;
+    const int nh = SS_BINS - SS_F;
+    const int xf = FFMIN(SS_HB_XFADE, nh);
+    double num = 0.0, den = 0.0, edge = 0.0;
+    float plateau;
+    int f;
+
+    /* What is this frame's mask DOING at the top of the band the network can
+     * see? Weighted by the mixture's own magnitude, so bins that carry
+     * something count and near-empty bins do not: an unweighted mean is
+     * dominated by whatever the network happens to say about silence. */
+    for (f = SS_F - SS_HB_TAIL; f < SS_F; f++) {
+        num += (double) m[f] * mag[f];
+        den += mag[f];
+    }
+    if (den > SS_EPSILON) {
+        plateau = (float) (num / den);
+    } else {
+        /* Silence up there: there is no weighting to be had, so take the plain
+         * mean rather than divide by nothing. */
+        num = 0.0;
+        for (f = SS_F - SS_HB_TAIL; f < SS_F; f++)
+            num += m[f];
+        plateau = (float) (num / SS_HB_TAIL);
+    }
+
+    for (f = SS_F - SS_HB_EDGE; f < SS_F; f++)
+        edge += m[f];
+    edge /= SS_HB_EDGE;
+
+    /* Raised cosine from the mask's own value at the edge into the plateau, so
+     * the modelled band and the extrapolated one meet without a step. The step
+     * is the entire problem being solved here -- see SS_HB_XFADE. */
+    for (f = 0; f < xf; f++) {
+        const float r = 0.5f - 0.5f * cosf((float) M_PI * f / xf);
+
+        hi[f] = (float) edge * (1.0f - r) + plateau * r;
+    }
+    for (f = xf; f < nh; f++)
+        hi[f] = plateau;
+}
+
 static void ss_build_masks(StemSplitContext *s, const float *est[SS_NB_INSTRUMENTS],
                            float *mask[SS_NB_INSTRUMENTS])
 {
     const int n = s->nb_instruments;
+    const float p = s->exponent;
+    const int pow2 = p == 2.0f;
+    /* Blend toward uniform: m' = (1 - n*b) * m + b. Preserves the sum exactly,
+     * and floors every mask at b -- so no stem is ever pushed further down than
+     * 20*log10(b) dB below the mixture. What that buys is the deepest spectral
+     * holes filled in, which is where musical noise comes from.
+     *
+     * It is NOT a cure for the ducking, and this comment says so because the
+     * shape of the option invites the assumption. Swept against a measured
+     * duck of -10.5 dB: b=0.03 gives -10.3, b=0.10 gives -9.5, b=0.25 gives
+     * -6.2 -- while the vocal left in the accompaniment climbs from -28.0 dB
+     * to -11.8 over the same sweep. The ducking is the whole band moving
+     * together, and a floor only catches bins that were already at the bottom.
+     * Off by default. */
+    const float b = av_clipf(s->bleed, 0.0f, 1.0f / n);
+    const float bs = 1.0f - n * b;
     int c, t, f, i;
 
     for (c = 0; c < SS_CHANNELS; c++)
         for (t = 0; t < SS_T; t++) {
+            const float *mag = s->mag + ss_nidx(c, t, 0);
+
             for (f = 0; f < SS_F; f++) {
                 const size_t k = ss_nidx(c, t, f);
                 float sum = SS_EPSILON;
+                float e[SS_NB_INSTRUMENTS];
 
+                for (i = 0; i < n; i++) {
+                    e[i] = pow2 ? est[i][k] * est[i][k]
+                                : powf(FFMAX(est[i][k], 0.0f), p);
+                    sum += e[i];
+                }
                 for (i = 0; i < n; i++)
-                    sum += est[i][k] * est[i][k];
-                for (i = 0; i < n; i++)
-                    mask[i][ss_idx(c, t, f)] =
-                        (est[i][k] * est[i][k] + SS_EPSILON / n) / sum;
+                    mask[i][ss_idx(c, t, f)] = (e[i] + SS_EPSILON / n) / sum;
             }
 
             /* ---- the band the network does not model ---- */
@@ -1591,12 +1779,21 @@ static void ss_build_masks(StemSplitContext *s, const float *est[SS_NB_INSTRUMEN
                 break;
 
             case SS_HB_PASSTHROUGH:
-            default:
-                /* The default, and an explicit product decision: the untouched
-                 * high band goes to exactly one stem -- the LAST instrument in
-                 * the model's list, which for 2stems is accompaniment -- and is
-                 * zeroed in the others. Cymbals and air survive in a karaoke
-                 * track, which upstream's "zeros" throws away. */
+                /* The untouched high band goes to exactly one stem -- the LAST
+                 * instrument in the model's list, which for 2stems is
+                 * accompaniment -- and is zeroed in the others.
+                 *
+                 * This was the default until it was measured. Nothing is
+                 * lost, but the accompaniment's spectrum STEPS UP as it
+                 * crosses 11.025 kHz -- see SS_HB_TAIL for the figures --
+                 * because below the edge the vocal network has claimed nearly
+                 * everything and above it the accompaniment gets all of it
+                 * unconditionally. A bright band with nothing underneath it,
+                 * riding over a body that ducks whenever the singer sings, is
+                 * what gets reported as a high whistle and a fader. Kept,
+                 * because it is the only mode under which the high band
+                 * survives bit for bit and some uses want that; it is no
+                 * longer what an unconfigured filter does. */
                 for (i = 0; i < n; i++) {
                     float *hi = mask[i] + ss_idx(c, t, SS_F);
                     const float v = i == n - 1 ? 1.0f : 0.0f;
@@ -1605,7 +1802,36 @@ static void ss_build_masks(StemSplitContext *s, const float *est[SS_NB_INSTRUMEN
                         hi[f] = v;
                 }
                 break;
+
+            case SS_HB_EXTEND:
+            default:
+                /* The default: carry each stem's OWN decision at the top of
+                 * the modelled band upward, crossfaded in so the two bands
+                 * meet smoothly. Cymbals and air still land in the
+                 * accompaniment, because that is what the mask says about them
+                 * just below the edge -- but sibilance now follows the vocal up
+                 * there too, instead of being left behind in the
+                 * instrumental. That second half is the larger effect: under
+                 * every other mode a vocal stem is hard-cut at 11 kHz, and on
+                 * a measured ballad this puts 37 dB of 11-14 kHz and 50 dB of
+                 * 14-18 kHz back into it -- the sibilance and breath whose
+                 * absence is what makes an a-cappella sound lisping. */
+                for (i = 0; i < n; i++)
+                    ss_extend_band(s, mask[i] + ss_idx(c, t, 0), mag);
+                break;
             }
+
+            if (s->smooth > 0)
+                for (i = 0; i < n; i++)
+                    ss_smooth_band(s, mask[i] + ss_idx(c, t, 0));
+
+            if (b > 0.0f)
+                for (i = 0; i < n; i++) {
+                    float *m = mask[i] + ss_idx(c, t, 0);
+
+                    for (f = 0; f < SS_BINS; f++)
+                        m[f] = bs * m[f] + b;
+                }
         }
 }
 
@@ -1632,6 +1858,8 @@ static void ss_build_masks(StemSplitContext *s, const float *est[SS_NB_INSTRUMEN
  */
 
 static int ss_emit_frames(AVFilterContext *ctx, int nb_frames);
+static int ss_push_samples(AVFilterContext *ctx, uint8_t * const *data,
+                           int nb_samples);
 
 /* Runs one segment: gathers its magnitude out of the ring, infers, builds the
  * ratio masks, blends them with any overlapping neighbour, and retires the
@@ -1709,6 +1937,356 @@ static int ss_process_segment(AVFilterContext *ctx)
     s->next_segment++;
 
     return ss_emit_frames(ctx, (int) (base + s->hop_frames - s->frames_done));
+}
+
+/* ---- Rate and layout adaptation -----------------------------------------
+ *
+ * The network is a 44.1 kHz stereo model and the entire segment driver above
+ * is written in those terms. Rather than teach the driver about other rates,
+ * the filter converts at its edges: swr_in folds whatever arrives into 44.1 kHz
+ * stereo, and one swr_out per output pad puts each finished stem back into the
+ * rate and layout the input actually had.
+ *
+ * 44.1 kHz two-channel input takes NONE of this. s->resampling is 0, both
+ * contexts stay NULL, and the sample path is byte for byte the one that
+ * existed before any of this was written -- which is the point: the format
+ * every music file in practice already is must not pay for the ones that are
+ * not, and must not risk a regression from them either.
+ *
+ * One resampler per output pad rather than one shared: an SwrContext carries
+ * per-stream state and the pads are separate streams. They are configured
+ * identically and fed identical sample counts, so they stay in lockstep, and
+ * ss_emit_samples asserts that rather than assuming it.
+ */
+
+static void ss_rs_free(StemSplitContext *s)
+{
+    int i;
+
+    swr_free(&s->swr_in);
+    for (i = 0; i < SS_NB_INSTRUMENTS; i++)
+        swr_free(&s->swr_out[i]);
+    if (s->rs_data)
+        av_freep(&s->rs_data[0]);
+    av_freep(&s->rs_data);
+    s->rs_nb_samples = 0;
+    av_channel_layout_uninit(&s->out_layout);
+}
+
+static int ss_rs_init(AVFilterContext *ctx, AVFilterLink *inlink)
+{
+    StemSplitContext *s = ctx->priv;
+    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+    int j, ret;
+
+    /* config_props can run more than once if the graph is reconfigured, and
+     * everything below allocates. Start from nothing rather than leak the
+     * previous configuration's resamplers. */
+    ss_rs_free(s);
+
+    s->out_rate = inlink->sample_rate;
+    ret = av_channel_layout_copy(&s->out_layout, &inlink->ch_layout);
+    if (ret < 0)
+        return ret;
+
+    /* Two channels at 44.1 kHz is the network's own format; take it as-is
+     * whatever the layout mask happens to call itself, because the driver only
+     * ever treats plane 0 and plane 1 as the two channels it was trained on.
+     * Insisting on the exact AV_CHANNEL_LAYOUT_STEREO mask here would put a
+     * pointless resampler in the path of, say, a file tagged "downmix". */
+    if (s->out_rate == SS_SAMPLE_RATE && s->out_layout.nb_channels == SS_CHANNELS) {
+        s->resampling = 0;
+        av_log(ctx, AV_LOG_VERBOSE,
+               "stemsplit: 44.1 kHz stereo input; running the network's native "
+               "format with no conversion.\n");
+        return 0;
+    }
+
+    s->resampling = 1;
+
+    if (s->out_layout.nb_channels > SS_CHANNELS)
+        av_log(ctx, AV_LOG_WARNING,
+               "stemsplit: the separation network is a stereo model, so %d-channel "
+               "input is folded to stereo for it and upmixed back afterwards. The "
+               "stems will have %d channels again, but they are derived from a "
+               "stereo fold and are not a true multichannel separation.\n",
+               s->out_layout.nb_channels, s->out_layout.nb_channels);
+
+    ret = swr_alloc_set_opts2(&s->swr_in,
+                              &stereo, AV_SAMPLE_FMT_FLTP, SS_SAMPLE_RATE,
+                              &s->out_layout, AV_SAMPLE_FMT_FLTP, s->out_rate,
+                              0, ctx);
+    if (ret < 0)
+        return ret;
+    ret = swr_init(s->swr_in);
+    if (ret < 0)
+        return ret;
+
+    for (j = 0; j < s->nb_outputs; j++) {
+        ret = swr_alloc_set_opts2(&s->swr_out[j],
+                                  &s->out_layout, AV_SAMPLE_FMT_FLTP, s->out_rate,
+                                  &stereo, AV_SAMPLE_FMT_FLTP, SS_SAMPLE_RATE,
+                                  0, ctx);
+        if (ret < 0)
+            return ret;
+        ret = swr_init(s->swr_out[j]);
+        if (ret < 0)
+            return ret;
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE,
+           "stemsplit: input is %d Hz, %d channel(s); separating at %d Hz stereo "
+           "and converting the stems back.\n",
+           s->out_rate, s->out_layout.nb_channels, SS_SAMPLE_RATE);
+
+    return 0;
+}
+
+/* Grows the staging buffer swr_in converts into. Planar float, SS_CHANNELS
+ * planes, kept across calls so a 1152-sample MP3 frame does not allocate. */
+static int ss_rs_reserve(StemSplitContext *s, int nb_samples)
+{
+    int ret;
+
+    if (s->rs_data && nb_samples <= s->rs_nb_samples)
+        return 0;
+
+    if (s->rs_data)
+        av_freep(&s->rs_data[0]);
+    av_freep(&s->rs_data);
+    s->rs_nb_samples = 0;
+
+    ret = av_samples_alloc_array_and_samples(&s->rs_data, NULL, SS_CHANNELS,
+                                             nb_samples, AV_SAMPLE_FMT_FLTP, 0);
+    if (ret < 0)
+        return ret;
+    s->rs_nb_samples = nb_samples;
+
+    return 0;
+}
+
+/* Feeds `nb_samples` of native-format planar float through swr_in and into the
+ * segment driver. `data` NULL drains the resampler's own delay at EOF, which
+ * is what makes s->total_in cover the whole input rather than all but the last
+ * few milliseconds of it. */
+static int ss_rs_push(AVFilterContext *ctx, uint8_t * const *data, int nb_samples)
+{
+    StemSplitContext *s = ctx->priv;
+    int want, got, ret;
+
+    want = swr_get_out_samples(s->swr_in, nb_samples);
+    if (want <= 0)
+        return 0;
+
+    ret = ss_rs_reserve(s, want);
+    if (ret < 0)
+        return ret;
+
+    got = swr_convert(s->swr_in, s->rs_data, want,
+                      (const uint8_t **) data, nb_samples);
+    if (got < 0)
+        return got;
+    if (!got)
+        return 0;
+
+    return ss_push_samples(ctx, s->rs_data, got);
+}
+
+/* Turns `n` finished samples of every output pad's overlap-add accumulator,
+ * starting at `off`, into one AVFrame per live pad in out[]. The caller pushes
+ * them; this only builds them.
+ *
+ * This is the single place that converts back to the input's rate and layout,
+ * stamps PTS, and counts what has been emitted. Two counters are kept because
+ * there are two clocks: s->emitted is in the internal 44.1 kHz samples that
+ * drive the flush loop and the segment machinery, s->emitted_native is in the
+ * samples that actually reach the file. They are the same number whenever
+ * s->resampling is 0.
+ */
+static int ss_emit_samples(AVFilterContext *ctx, AVFrame **out, int off, int n,
+                           int flush)
+{
+    StemSplitContext *s = ctx->priv;
+    int64_t pts, dur;
+    int j, c, got = -1;
+
+    /* n == 0 is NOT a flush. The lead-in crop retires four whole frames whose
+     * every sample is discarded, so this is called with n == 0 four times
+     * before the first real sample -- and telling swresample the input has
+     * ended, four times, at the very start, would be a fine way to lose the
+     * first hop of every resampled file. `flush` is an explicit argument for
+     * exactly that reason; only ss_drain_outputs sets it. */
+    if (n <= 0 && !flush)
+        return 0;
+
+    s->emitted += n;
+
+    for (j = 0; j < ctx->nb_outputs; j++) {
+        AVFilterLink *outlink = ctx->outputs[j];
+        const uint8_t *in[SS_CHANNELS];
+        int want, ret;
+
+        if (ff_outlink_get_status(outlink))
+            continue;   /* downstream is gone; keep processing, drop output */
+
+        if (!s->resampling) {
+            av_assert0(n > 0);   /* guarded above: !resampling never flushes */
+            out[j] = ff_get_audio_buffer(outlink, n);
+            if (!out[j])
+                return AVERROR(ENOMEM);
+            for (c = 0; c < SS_CHANNELS; c++)
+                memcpy(out[j]->extended_data[c], s->ola[j][c] + off,
+                       n * sizeof(float));
+            got = n;
+            continue;
+        }
+
+        for (c = 0; c < SS_CHANNELS; c++)
+            in[c] = (const uint8_t *) (s->ola[j][c] + off);
+
+        /* A NULL input is swresample's flush: hand back whatever delay is
+         * still inside. ss_flush uses it to square the output length with the
+         * input's. */
+        want = swr_get_out_samples(s->swr_out[j], n);
+        if (want <= 0)
+            continue;
+
+        out[j] = ff_get_audio_buffer(outlink, want);
+        if (!out[j])
+            return AVERROR(ENOMEM);
+
+        ret = swr_convert(s->swr_out[j], out[j]->extended_data, want,
+                          flush ? NULL : in, n);
+        if (ret < 0) {
+            av_frame_free(&out[j]);
+            return ret;
+        }
+
+        /* Identical configuration, identical input counts: the pads agree or
+         * something is wrong with an assumption, not with the audio. */
+        av_assert0(got < 0 || got == ret);
+        got = ret;
+        out[j]->nb_samples = ret;
+    }
+
+    if (got <= 0) {
+        for (j = 0; j < ctx->nb_outputs; j++)
+            av_frame_free(&out[j]);
+        return 0;
+    }
+
+    /* The tail of the last segment was zero-padded to a whole SS_T frames and
+     * the two resamplers each carry their own delay, so the native output can
+     * only be trimmed to length here, where the native count is known. The
+     * internal-rate cap in ss_emit_frames does the same job one clock up. */
+    if (s->flushing) {
+        const int64_t room = FFMAX(s->total_in_native - s->emitted_native, 0);
+
+        if (got > room)
+            got = (int) room;
+    }
+
+    if (got <= 0) {
+        for (j = 0; j < ctx->nb_outputs; j++)
+            av_frame_free(&out[j]);
+        return 0;
+    }
+
+    pts = s->next_pts;
+    dur = av_rescale_q(got, (AVRational) { 1, s->out_rate },
+                       ctx->outputs[0]->time_base);
+
+    for (j = 0; j < ctx->nb_outputs; j++) {
+        if (!out[j])
+            continue;
+        out[j]->nb_samples = got;
+        out[j]->pts        = pts;
+        out[j]->duration   = dur;
+    }
+
+    if (s->next_pts != AV_NOPTS_VALUE)
+        s->next_pts += dur;
+    s->emitted_native += got;
+
+    return 0;
+}
+
+/* Hands every frame in out[] to its pad and clears the slot, so the caller's
+ * error path cannot double-free one that has already been sent. */
+static int ss_push_outputs(AVFilterContext *ctx, AVFrame **out)
+{
+    int j, ret;
+
+    for (j = 0; j < ctx->nb_outputs; j++) {
+        AVFrame *frame = out[j];
+
+        if (!frame)
+            continue;
+        out[j] = NULL;
+        ret = ff_filter_frame(ctx->outputs[j], frame);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+/* One pass of swr_out's remaining delay, emitted. Only meaningful while
+ * resampling; ss_flush calls it until it stops producing anything. */
+static int ss_drain_outputs(AVFilterContext *ctx)
+{
+    AVFrame *out[SS_NB_INSTRUMENTS] = { NULL };
+    int j, ret;
+
+    ret = ss_emit_samples(ctx, out, 0, 0, 1);
+    if (ret < 0)
+        goto fail;
+
+    return ss_push_outputs(ctx, out);
+
+fail:
+    for (j = 0; j < SS_NB_INSTRUMENTS; j++)
+        av_frame_free(&out[j]);
+    return ret;
+}
+
+/* Emits `n` samples of silence on every live pad. The two resamplers each round
+ * their own way, so the round trip can land a handful of samples short of the
+ * input length; this makes up the difference rather than leaving a file that is
+ * a millisecond shorter than the one it came from. */
+static int ss_emit_silence(AVFilterContext *ctx, int n)
+{
+    StemSplitContext *s = ctx->priv;
+    AVFrame *out[SS_NB_INSTRUMENTS] = { NULL };
+    const int64_t pts = s->next_pts;
+    const int64_t dur = av_rescale_q(n, (AVRational) { 1, s->out_rate },
+                                     ctx->outputs[0]->time_base);
+    int j, ret;
+
+    for (j = 0; j < ctx->nb_outputs; j++) {
+        if (ff_outlink_get_status(ctx->outputs[j]))
+            continue;
+        out[j] = ff_get_audio_buffer(ctx->outputs[j], n);
+        if (!out[j]) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        av_samples_set_silence(out[j]->extended_data, 0, n,
+                               out[j]->ch_layout.nb_channels, AV_SAMPLE_FMT_FLTP);
+        out[j]->pts      = pts;
+        out[j]->duration = dur;
+    }
+
+    if (s->next_pts != AV_NOPTS_VALUE)
+        s->next_pts += dur;
+    s->emitted_native += n;
+
+    return ss_push_outputs(ctx, out);
+
+fail:
+    for (j = 0; j < SS_NB_INSTRUMENTS; j++)
+        av_frame_free(&out[j]);
+    return ret;
 }
 
 /* Retires nb_frames frames: masks each one's mixture spectrum, resynthesises
@@ -1797,30 +2375,9 @@ static int ss_emit_frames(AVFilterContext *ctx, int nb_frames)
         if (s->flushing)
             n = (int) FFMIN((int64_t) n, FFMAX(s->total_in - s->emitted, 0));
 
-        if (n > 0) {
-            const int64_t pts = s->next_pts;
-            const int64_t dur = av_rescale_q(n, (AVRational) { 1, SS_SAMPLE_RATE },
-                                             ctx->outputs[0]->time_base);
-
-            for (j = 0; j < ctx->nb_outputs; j++) {
-                if (ff_outlink_get_status(ctx->outputs[j]))
-                    continue;   /* downstream is gone; keep processing, drop output */
-                out[j] = ff_get_audio_buffer(ctx->outputs[j], n);
-                if (!out[j]) {
-                    ret = AVERROR(ENOMEM);
-                    goto fail;
-                }
-                for (c = 0; c < SS_CHANNELS; c++)
-                    memcpy(out[j]->extended_data[c], s->ola[j][c] + src_off,
-                           n * sizeof(float));
-                out[j]->pts      = pts;
-                out[j]->duration = dur;
-            }
-
-            if (s->next_pts != AV_NOPTS_VALUE)
-                s->next_pts += dur;
-            s->emitted += n;
-        }
+        ret = ss_emit_samples(ctx, out, src_off, n, 0);
+        if (ret < 0)
+            goto fail;
 
         /* Slide each accumulator by one hop and zero the tail that exposes,
          * ready for the next frame's overlap-add. */
@@ -1836,16 +2393,9 @@ static int ss_emit_frames(AVFilterContext *ctx, int nb_frames)
 
         s->frames_done++;
 
-        for (j = 0; j < ctx->nb_outputs; j++) {
-            AVFrame *frame = out[j];
-
-            if (!frame)
-                continue;
-            out[j] = NULL;
-            ret = ff_filter_frame(ctx->outputs[j], frame);
-            if (ret < 0)
-                goto fail;
-        }
+        ret = ss_push_outputs(ctx, out);
+        if (ret < 0)
+            goto fail;
     }
 
     return 0;
@@ -1909,7 +2459,11 @@ static int ss_driver_start(AVFilterContext *ctx)
     return ss_push_frame(ctx);
 }
 
-static int ss_push_samples(AVFilterContext *ctx, const AVFrame *frame)
+/* Takes SS_CHANNELS planes of planar float already at SS_SAMPLE_RATE -- either
+ * straight off the input frame, or out of swr_in when the input was some other
+ * format -- and stages them into the sliding analysis window. */
+static int ss_push_samples(AVFilterContext *ctx, uint8_t * const *data,
+                           int nb_samples)
 {
     StemSplitContext *s = ctx->priv;
     int offset = 0, ret;
@@ -1918,16 +2472,16 @@ static int ss_push_samples(AVFilterContext *ctx, const AVFrame *frame)
     if (ret < 0)
         return ret;
 
-    s->total_in += frame->nb_samples;
+    s->total_in += nb_samples;
 
-    while (offset < frame->nb_samples) {
-        const int n = FFMIN(frame->nb_samples - offset,
+    while (offset < nb_samples) {
+        const int n = FFMIN(nb_samples - offset,
                             SS_FRAME_STEP - s->an_stage_fill);
         int c;
 
         for (c = 0; c < SS_CHANNELS; c++)
             memcpy(s->an_stage[c] + s->an_stage_fill,
-                   (const float *) frame->extended_data[c] + offset,
+                   (const float *) data[c] + offset,
                    n * sizeof(float));
         s->an_stage_fill += n;
         offset += n;
@@ -1951,6 +2505,16 @@ static int ss_flush(AVFilterContext *ctx)
     StemSplitContext *s = ctx->priv;
     int ret;
 
+    /* Drain swr_in FIRST. Its delay is real input the driver has not been
+     * given yet, and s->total_in -- which the loop below is a race against --
+     * would otherwise be short by it, cutting the last few milliseconds off
+     * every resampled file. */
+    if (s->resampling) {
+        ret = ss_rs_push(ctx, NULL, 0);
+        if (ret < 0)
+            return ret;
+    }
+
     ret = ss_driver_start(ctx);
     if (ret < 0)
         return ret;
@@ -1965,6 +2529,45 @@ static int ss_flush(AVFilterContext *ctx)
                    (SS_FRAME_STEP - s->an_stage_fill) * sizeof(float));
 
         ret = ss_push_hop(ctx);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* And swr_out's delay on the way back, so the file is exactly as long as
+     * the one that went in. Each pass emits at most what is still owed
+     * (ss_emit_samples caps against total_in_native while flushing), and a
+     * pass that produces nothing ends it -- there is no more audio in the
+     * resampler and looping further would spin. */
+    while (s->resampling && s->emitted_native < s->total_in_native) {
+        const int64_t before = s->emitted_native;
+
+        ret = ss_drain_outputs(ctx);
+        if (ret < 0)
+            return ret;
+        if (s->emitted_native == before)
+            break;
+    }
+
+    if (s->resampling && s->emitted_native < s->total_in_native) {
+        const int64_t short_by = s->total_in_native - s->emitted_native;
+
+        /* A handful of samples is the two resamplers rounding their own way,
+         * and padding those is right. A second of them is not rounding, it is
+         * a bug somewhere above -- and quietly appending a second of silence
+         * would hide it at the end of a file nobody listens all the way
+         * through. Say so instead, and pad only what is plausibly rounding. */
+        if (short_by > s->out_rate)
+            av_log(ctx, AV_LOG_WARNING,
+                   "stemsplit: the output is %" PRId64 " samples (%.3f s) shorter "
+                   "than the input, which is far more than resampler rounding. "
+                   "Padding %d samples and stopping; please report this.\n",
+                   short_by, short_by / (double) s->out_rate, s->out_rate);
+        else
+            av_log(ctx, AV_LOG_DEBUG,
+                   "stemsplit: resampler round trip came up %" PRId64 " sample(s) "
+                   "short; padding.\n", short_by);
+
+        ret = ss_emit_silence(ctx, (int) FFMIN(short_by, (int64_t) s->out_rate));
         if (ret < 0)
             return ret;
     }
@@ -1992,6 +2595,7 @@ static void ss_driver_free(StemSplitContext *s)
     av_freep(&s->w_acc);
     av_freep(&s->seg_win);
     av_freep(&s->work_spec);
+    av_freep(&s->smooth_buf);
 }
 
 static int ss_driver_init(AVFilterContext *ctx)
@@ -2036,6 +2640,12 @@ static int ss_driver_init(AVFilterContext *ctx)
     s->seg_win   = av_calloc(SS_T, sizeof(float));
     if (!s->spec_ring || !s->mag || !s->work_spec || !s->seg_win)
         return AVERROR(ENOMEM);
+
+    if (s->smooth > 0) {
+        s->smooth_buf = av_calloc(SS_BINS, sizeof(float));
+        if (!s->smooth_buf)
+            return AVERROR(ENOMEM);
+    }
 
     for (i = 0; i < s->nb_instruments; i++) {
         s->est[i]  = av_calloc(net_floats, sizeof(float));
@@ -2224,6 +2834,16 @@ static av_cold void uninit(AVFilterContext *ctx)
 
     ss_dsp_free(s);
     ss_driver_free(s);
+    ss_rs_free(s);
+}
+
+/* Format negotiation has settled by the time this runs, so this is where the
+ * filter learns what it is actually being fed and decides whether the network
+ * needs a resampler on each side of it. ss_rs_init needs s->nb_outputs, which
+ * init() has already set. */
+static int ss_config_input(AVFilterLink *inlink)
+{
+    return ss_rs_init(inlink->dst, inlink);
 }
 
 static int ss_filter_frame(AVFilterContext *ctx, AVFrame *frame)
@@ -2247,7 +2867,10 @@ static int ss_filter_frame(AVFilterContext *ctx, AVFrame *frame)
     if (s->debug_input_path && *s->debug_input_path)
         return ff_filter_frame(ctx->outputs[0], frame);
 
-    ret = ss_push_samples(ctx, frame);
+    s->total_in_native += frame->nb_samples;
+
+    ret = s->resampling ? ss_rs_push(ctx, frame->extended_data, frame->nb_samples)
+                        : ss_push_samples(ctx, frame->extended_data, frame->nb_samples);
     av_frame_free(&frame);
 
     return ret;
@@ -2311,10 +2934,14 @@ static const AVOption stemsplit_options[] = {
         { "vocals", "vocal stem only", 0, AV_OPT_TYPE_CONST, { .i64 = SS_STEM_VOCALS }, 0, 0, FLAGS, .unit = "stem" },
         { "accompaniment", "accompaniment stem only", 0, AV_OPT_TYPE_CONST, { .i64 = SS_STEM_ACCOMPANIMENT }, 0, 0, FLAGS, .unit = "stem" },
         { "all", "both stems, one per output pad", 0, AV_OPT_TYPE_CONST, { .i64 = SS_STEM_ALL }, 0, 0, FLAGS, .unit = "stem" },
-    { "highband", "how to reconstruct frequencies above the network's band", OFFSET(highband), AV_OPT_TYPE_INT, { .i64 = SS_HB_PASSTHROUGH }, 0, SS_HB_AVERAGE, FLAGS, .unit = "highband" },
+    { "highband", "how to reconstruct frequencies above the network's band", OFFSET(highband), AV_OPT_TYPE_INT, { .i64 = SS_HB_EXTEND }, 0, SS_HB_EXTEND, FLAGS, .unit = "highband" },
         { "passthrough", "route the input high band into the last stem", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_PASSTHROUGH }, 0, 0, FLAGS, .unit = "highband" },
         { "zeros", "silence the high band in every stem (upstream Spleeter)", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_ZEROS }, 0, 0, FLAGS, .unit = "highband" },
         { "average", "tile each frame's mean mask across the high band", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_AVERAGE }, 0, 0, FLAGS, .unit = "highband" },
+        { "extend", "carry each stem's mask at the top of the band upward", 0, AV_OPT_TYPE_CONST, { .i64 = SS_HB_EXTEND }, 0, 0, FLAGS, .unit = "highband" },
+    { "exponent", "separation exponent; lower is softer, higher is harder", OFFSET(exponent), AV_OPT_TYPE_FLOAT, { .dbl = 2.0 }, 0.25, 8.0, FLAGS },
+    { "bleed", "minimum share of the mixture every stem keeps, limiting how far one can duck", OFFSET(bleed), AV_OPT_TYPE_FLOAT, { .dbl = 0.0 }, 0.0, 0.5, FLAGS },
+    { "smooth", "smooth the masks over this many frequency bins either side (0 disables)", OFFSET(smooth), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 32, FLAGS },
     { "overlap", "segment overlap as a duration, crossfaded on output", OFFSET(overlap), AV_OPT_TYPE_DURATION, { .i64 = 0 }, 0, 60000000, FLAGS },
     { "threads", "number of ggml threads", OFFSET(nb_threads), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS },
     { "dump", "Internal: directory to dump intermediate tensors to for parity testing; empty disables", OFFSET(dump_dir), AV_OPT_TYPE_STRING, { .str = "" }, .flags = FLAGS },
@@ -2326,6 +2953,14 @@ static const AVOption stemsplit_options[] = {
 
 AVFILTER_DEFINE_CLASS(stemsplit);
 
+static const AVFilterPad ss_inputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_AUDIO,
+        .config_props = ss_config_input,
+    },
+};
+
 const FFFilter ff_af_stemsplit = {
     .p.name        = "stemsplit",
     .p.description = NULL_IF_CONFIG_SMALL("Separate music into vocal and accompaniment stems."),
@@ -2336,6 +2971,6 @@ const FFFilter ff_af_stemsplit = {
     .uninit        = uninit,
     .activate      = activate,
     .priv_size     = sizeof(StemSplitContext),
-    FILTER_INPUTS(ff_audio_default_filterpad),
+    FILTER_INPUTS(ss_inputs),
     FILTER_QUERY_FUNC2(query_formats),
 };
