@@ -32,7 +32,7 @@ env:
 
 jobs:
   detect-changes:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     outputs:
       version: ${{ steps.version.outputs.version }}
       base-changed: ${{ steps.detect.outputs.base-changed }}
@@ -68,22 +68,20 @@ jobs:
 
           # ── Per-platform test-runner mapping ──────────────────────────────
           # Single source of truth for "how do we smoke-test platform X":
-          #   os    — GitHub-hosted runner image
+          #   os    — label set of the verification runner, as a JSON array
           #   ext   — archive extension produced by the build
           #   kind  — "unix" or "windows" (selects the test script)
-          # macos-15-intel is the supported x86_64 macOS runner (macos-13 was
-          # retired 2025-12-04; Intel macOS is supported until ~Fall 2027).
-          # macos-latest is arm64. ubuntu-latest is x86_64 — linux-aarch64 can
-          # only verify the archive extracts, smoke.sh handles the cross-arch skip.
-          # freebsd-x86_64 has no GitHub-hosted runner; like linux-aarch64 it
-          # runs on ubuntu-latest where smoke.sh downgrades to a presence check.
+          # The ffmpeg-verify fleet carries one label per target, so a platform
+          # names its own machine. linux-aarch64 and freebsd-x86_64 have no host
+          # of their own and land on the linux box, which is what they did on
+          # ubuntu-latest - smoke.sh downgrades both to a presence check.
           declare -A OS=(
-            [linux-x86_64]=ubuntu-latest
-            [linux-aarch64]=ubuntu-latest
-            [windows-x86_64]=windows-latest
-            [darwin-x86_64]=macos-15-intel
-            [darwin-arm64]=macos-latest
-            [freebsd-x86_64]=ubuntu-latest
+            [linux-x86_64]='["self-hosted","ffmpeg-verify","linux-x86_64"]'
+            [linux-aarch64]='["self-hosted","ffmpeg-verify","linux-x86_64"]'
+            [windows-x86_64]='["self-hosted","ffmpeg-verify","windows-x86_64"]'
+            [darwin-x86_64]='["self-hosted","ffmpeg-verify","darwin-x86_64"]'
+            [darwin-arm64]='["self-hosted","ffmpeg-verify","darwin-arm64"]'
+            [freebsd-x86_64]='["self-hosted","ffmpeg-verify","freebsd-driver"]'
           )
           declare -A EXT=(
             [linux-x86_64]=tar.gz

@@ -25,7 +25,7 @@ jobs:
       github.event_name != 'workflow_run' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'master')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     outputs:
       skip: ${{ steps.version-check.outputs.skip }}
     steps:
@@ -54,7 +54,7 @@ jobs:
   publish-npm:
     needs: check
     if: needs.check.outputs.skip != 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     permissions:
       contents: read
       id-token: write
