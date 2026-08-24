@@ -40,7 +40,7 @@ jobs:
   # Everything downstream is pinned to the head SHA resolved here, so a verify
   # run that started against an older push can never tick boxes for a newer one.
   resolve:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     outputs:
       should-run: ${{ steps.resolve.outputs.should-run }}
       pr: ${{ steps.resolve.outputs.pr }}
@@ -354,7 +354,7 @@ jobs:
   sync-checklist:
     needs: [resolve, verify]
     if: always() && needs.resolve.outputs.should-run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
