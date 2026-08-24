@@ -19,7 +19,7 @@ concurrency:
 jobs:
   guard-source-branch:
     if: github.base_ref == 'master'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     steps:
       - name: Enforce PR source branch is dev
         env:
@@ -36,7 +36,7 @@ jobs:
   # a regression in them is silent by construction: the failure mode is a box
   # that ticks when it should not.
   checklist-scripts:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,7 +50,7 @@ jobs:
 
   checklist-complete:
     if: github.base_ref == 'master'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -65,7 +65,7 @@ jobs:
   pr-validation:
     needs: [guard-source-branch, checklist-complete, checklist-scripts]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     steps:
       - name: Verify all PR gates passed
         run: |

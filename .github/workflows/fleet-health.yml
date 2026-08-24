@@ -72,7 +72,7 @@ jobs:
   # the probe jobs on purpose: those cannot report a runner that never picked up
   # a job, because they would simply queue forever.
   registry:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     steps:
       - name: Check every verification label has an online runner
         env:

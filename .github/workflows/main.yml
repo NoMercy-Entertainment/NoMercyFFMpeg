@@ -163,7 +163,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.detect-changes.outputs.test-matrix) }}
-    runs-on: ${{ matrix.os }}
+    # A label set, not an image name: the verification fleet is addressed by
+    # label, and only an array can carry more than one.
+    runs-on: ${{ fromJSON(matrix.os) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -229,7 +231,7 @@ jobs:
       && github.event.pull_request.head.repo.full_name == github.repository
       && needs.export-artifacts.result == 'success'
       && needs.smoke-test.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     permissions:
       contents: write
     steps:
@@ -344,7 +346,7 @@ jobs:
   pr-build:
     needs: [detect-changes, build-base, build-platforms, export-artifacts, smoke-test]
     if: always() && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     steps:
       - name: Verify the PR build path is green
         env:
@@ -390,7 +392,7 @@ jobs:
       fail-fast: false
       matrix:
         platform: ${{ fromJSON(needs.detect-changes.outputs.platforms-to-build) }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     permissions:
       security-events: write
     steps:
@@ -423,7 +425,7 @@ jobs:
       github.event_name == 'push' && github.ref == 'refs/heads/master'
       && needs.export-artifacts.result == 'success'
       && needs.smoke-test.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, beast-unit]
     permissions:
       contents: write
     steps:
