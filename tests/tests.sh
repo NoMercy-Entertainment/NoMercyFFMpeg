@@ -59,6 +59,7 @@ SampleVideo="${TestRoot}/sample.mp4"
 SampleAudio="${TestRoot}/sample.wav"
 SampleImage="${TestRoot}/sample.png"
 SampleSubs="${TestRoot}/sample.ass"
+SampleSvg="${TestRoot}/sample.svg"
 
 rm -rf "${TestRoot}"
 mkdir -p "${TestRoot}"
@@ -81,6 +82,7 @@ generate_samples() {
 	[[ ! -f "$SampleAudio" ]] && ((Total_Count++))
 	[[ ! -f "$SampleImage" ]] && ((Total_Count++))
 	[[ ! -f "$SampleSubs" ]] && ((Total_Count++))
+	[[ ! -f "$SampleSvg" ]] && ((Total_Count++))
 
 	# Generate samples
 	if [[ ! -f "$SampleVideo" ]]; then
@@ -147,6 +149,16 @@ generate_samples() {
 		} >$SampleSubs
 		End_Time=$(date +%s)
 		text_with_padding "✅ Sample subtitles generated" "[$((End_Time - Start_Time))s]" 1
+	fi
+
+	# A hand-written SVG: decoding it needs the librsvg decoder, so the librsvg
+	# test below can only pass when librsvg was actually compiled in.
+	if [[ ! -f "$SampleSvg" ]]; then
+		Start_Time=$(date +%s)
+		Current_Count=$((Current_Count + 1))
+		printf '%s\n' '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#3355ff"/></svg>' >"$SampleSvg"
+		End_Time=$(date +%s)
+		text_with_padding "✅ Sample SVG generated" "[$((End_Time - Start_Time))s]" 1
 	fi
 
 	if [ $Total_Count -gt 0 ]; then
@@ -262,6 +274,7 @@ run_test "libopus" "-y -i ${SampleAudio} -c:a libopus ${TestRoot}/test_opus.opus
 run_test "libmp3lame" "-y -i ${SampleAudio} -c:a libmp3lame ${TestRoot}/test_mp3.mp3" "mp3"
 run_test "libwebp" "-y -i ${SampleImage} -c:v libwebp -f webp ${TestRoot}/test_webp.webp" "webp"
 run_test "libopenjpeg" "-y -i ${SampleImage} -c:v libopenjpeg ${TestRoot}/test_jp2.jp2" "openjpeg"
+run_test "librsvg" "-y -i ${SampleSvg} -frames:v 1 ${TestRoot}/test_svg.png" "svg"
 run_test "libass" "-y -i ${SampleVideo} -vf \"ass=${SampleSubs}\" ${TestRoot}/test_ass.mp4" "ass"
 run_test "auto_mkdir" "-y -f lavfi -i \"testsrc=duration=1:size=320x240:rate=1\" -frames:v 1 ${TestRoot}/subdir_test/nested/output.png" "output.png"
 
