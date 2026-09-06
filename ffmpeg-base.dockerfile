@@ -218,8 +218,12 @@ RUN \
     && echo "🔄 Start downloading freetype" \
     # savannah 302-redirects to a rotating mirror pool and some mirrors return
     # 5xx, which wget reports as exit 8. Retry so one bad mirror does not kill
-    # the whole base build; each attempt re-follows the redirect afresh.
-    && wget --tries=5 --waitretry=5 --retry-on-http-error=500,502,503,504 -O freetype.tar.gz https://download.savannah.gnu.org/releases/freetype/freetype-$(echo ${freetype_version} | tr '-' '.').tar.gz >/dev/null 2>&1 \
+    # the whole base build; each attempt re-follows the redirect afresh. When
+    # the pool is down altogether (2026-09-06: every attempt failed within a
+    # second, twice) the same tarball comes from SourceForge instead.
+    && { wget --tries=5 --waitretry=5 --retry-on-http-error=500,502,503,504 -O freetype.tar.gz https://download.savannah.gnu.org/releases/freetype/freetype-$(echo ${freetype_version} | tr '-' '.').tar.gz >/dev/null 2>&1 \
+         || { echo "⚠️ savannah failed, fetching freetype from sourceforge" \
+              && wget --tries=5 --waitretry=5 -O freetype.tar.gz https://downloads.sourceforge.net/freetype/freetype-$(echo ${freetype_version} | tr '-' '.').tar.gz >/dev/null 2>&1; }; } \
     && tar -xzf freetype.tar.gz >/dev/null 2>&1 && rm freetype.tar.gz && mv freetype-$(echo ${freetype_version} | tr '-' '.') freetype \
     # && git clone --branch VER-${freetype_version} https://gitlab.freedesktop.org/freetype/freetype.git freetype >/dev/null 2>&1 \
     && echo "✅ Download completed successfully" \

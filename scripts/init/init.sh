@@ -165,14 +165,6 @@ for i in /scripts/*.sh; do
         text_with_padding "✅ ${name} was built successfully" "[ ${end_time_string} ]" -1
         success_count=$((success_count + 1))
     else # This is failure
-        if [[ ${DEBUG} == "true" ]]; then
-            logtext=$(clean_whitespace "$(cat /ffmpeg_build.log)")
-            if [[ -n "${logtext}" ]]; then
-                printf "%s\n" "📃 Log: ${logtext}"
-            fi
-            rm -f /ffmpeg_build.log
-            exit 1
-        fi
         end_time=$(($(date +%s) - ${start_time}))
         end_time_string=$(printf "%02d%s" $end_time "s")
         if [ $end_time -gt 60 ]; then
@@ -181,6 +173,28 @@ for i in /scripts/*.sh; do
         fi
         text_with_padding "❌ ${name} build failed" "[ ${end_time_string} ]" -1
         failed_count=$((failed_count + 1))
+
+        # A failed component fails the build. This loop used to carry on: the
+        # component's --enable flag was simply never added, FFmpeg configured
+        # without it, the job went green, and the artifact shipped incomplete.
+        # v1.0.40-rc lost x265 on windows-x86_64 and librsvg on darwin-x86_64
+        # that way. Print the component's log so the cause is visible in CI
+        # instead of staying behind inside the container.
+        if [[ -f /ffmpeg_build.log ]]; then
+            if [[ ${DEBUG} == "true" ]]; then
+                logtext=$(clean_whitespace "$(cat /ffmpeg_build.log)")
+                if [[ -n "${logtext}" ]]; then
+                    printf "%s\n" "📃 Log: ${logtext}"
+                fi
+            else
+                echo "📃 Log for ${name} (last 200 lines of /ffmpeg_build.log):"
+                tail -n 200 /ffmpeg_build.log
+            fi
+            rm -f /ffmpeg_build.log
+        fi
+        hr # Print a horizontal line
+        text_with_padding "🛑 Aborting: ${name} did not build" ""
+        exit 1
     fi
     total_time=$((total_time + end_time))
 done

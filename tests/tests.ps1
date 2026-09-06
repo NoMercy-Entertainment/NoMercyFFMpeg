@@ -26,6 +26,7 @@ $SampleVideo = "$TestRoot\sample.mp4"
 $SampleAudio = "$TestRoot\sample.wav"
 $SampleImage = "$TestRoot\sample.png"
 $SampleSubs = "$TestRoot\sample.ass"
+$SampleSvg = "$TestRoot\sample.svg"
 $AssSubPath = $SampleSubs -replace '\\','/'
 $AssSubPath = $AssSubPath -replace ':','\\:'
 
@@ -52,6 +53,7 @@ function generate_samples {
     if (-Not (Test-Path $SampleAudio)) { $Total_Count++ }
     if (-Not (Test-Path $SampleImage)) { $Total_Count++ }
     if (-Not (Test-Path $SampleSubs)) { $Total_Count++ }
+    if (-Not (Test-Path $SampleSvg)) { $Total_Count++ }
 
     # Generate samples
     if (-Not (Test-Path $SampleVideo)) {
@@ -93,10 +95,22 @@ function generate_samples {
             'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text'
             'Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,Test subtitle'
         ) -join "`n"
-        [System.IO.File]::WriteAllText($SampleSubs, $assContent)  
+        [System.IO.File]::WriteAllText($SampleSubs, $assContent)
 
         $elapsed = (New-TimeSpan -Start $Start_Time -End (Get-Date)).TotalSeconds.ToString('0')
         text_with_padding "     $ICON_PASS Sample subtitles" "[${elapsed}s]"
+    }
+
+    # A hand-written SVG: decoding it needs the librsvg decoder, so the librsvg
+    # test below can only pass when librsvg was actually compiled in.
+    if (-Not (Test-Path $SampleSvg)) {
+        $Start_Time = Get-Date
+        $Current_Count++
+        $svgContent = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#3355ff"/></svg>'
+        [System.IO.File]::WriteAllText($SampleSvg, $svgContent)
+
+        $elapsed = (New-TimeSpan -Start $Start_Time -End (Get-Date)).TotalSeconds.ToString('0')
+        text_with_padding "     $ICON_PASS Sample SVG" "[${elapsed}s]"
     }
 
     if ($Current_Count -gt 0) {
@@ -203,6 +217,7 @@ run_test "libopus" "-y -i $SampleAudio -c:a libopus $TestRoot\test_opus.opus" "o
 run_test "libmp3lame" "-y -i $SampleAudio -c:a libmp3lame $TestRoot\test_mp3.mp3" "mp3"
 run_test "libwebp" "-y -i $SampleImage -c:v libwebp -f webp $TestRoot\test_webp.webp" "webp"
 run_test "libopenjpeg" "-y -i $SampleImage -c:v libopenjpeg $TestRoot\test_jp2.jp2" "openjpeg"
+run_test "librsvg" "-y -i $SampleSvg -frames:v 1 $TestRoot\test_svg.png" "svg"
 run_test "libass" "-y -i '${SampleVideo}' -vf ass='${AssSubPath}' '${TestRoot}/test_ass.mp4'" "ass"
 run_test "auto_mkdir" "-y -f lavfi -i `"testsrc=duration=1:size=320x240:rate=1`" -frames:v 1 $TestRoot\subdir_test\nested\output.png" "output.png"
 
@@ -223,6 +238,9 @@ run_test "libxml2" "-hide_banner -version | findstr xml" "xml"
 # AV1 codec tests
 run_test "libdav1d" "-hide_banner -decoders" "dav1d"
 run_test "librav1e" "-hide_banner -encoders" "rav1e"
+
+# Stemsplit filter
+run_test "stemsplit" "-hide_banner -filters | findstr stemsplit" "stemsplit"
 
 # OCR subtitle encoder
 run_test "ocr_subtitle" "-hide_banner -encoders" "ocr_subtitle"
